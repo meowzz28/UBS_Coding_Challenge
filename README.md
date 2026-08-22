@@ -10,10 +10,12 @@ app/
 ├── main.py                         # FastAPI entry point and router registration
 └── challenges/
     ├── adaptive_api.py             # Adaptive API Gateway
-    └── ghost_chains.py             # Ghost Chains Phase 1
+    ├── ghost_chains.py             # Ghost Chains Phase 1
+    └── tool_box.py                 # Tool Box Phase 1 MCP server
 tests/
 ├── test_adaptive_api.py
-└── test_ghost_chains.py
+├── test_ghost_chains.py
+└── test_tool_box.py
 render.yaml                         # Existing Render service configuration
 ```
 
@@ -30,6 +32,8 @@ Adding another challenge does not require another server or Render deployment.
 | Ghost Chains | `GET` | `/ghost-chains/health` |
 | Ghost Chains | `POST` | `/ghost-chains/reset` |
 | Ghost Chains | `POST` | `/ghost-chains/transactions` |
+| Tool Box | MCP | `/mcp` |
+| Tool Box | `GET` | `/tool-box/health` |
 
 The original `/solve` endpoint remains unchanged so the already-configured
 Adaptive API evaluation continues to work. New challenges use a namespaced path
@@ -129,7 +133,7 @@ No new server is needed. Commit and push the new router to the same `main` branc
 
 ```bash
 git add .
-git commit -m "Add modular Ghost Chains Phase 1 API"
+git commit -m "Add the next challenge API"
 git push origin main
 ```
 
@@ -153,10 +157,41 @@ The service uses one Uvicorn worker so all Ghost Chains requests share the same
 in-memory graph. A process restart restores clean startup state, and the evaluator
 can explicitly establish that state through `/ghost-chains/reset`.
 
+## Tool Box - Phase 1
+
+Tool Box is exposed through the official MCP Streamable HTTP transport rather
+than an ordinary REST endpoint. Register this URL with the evaluator:
+
+```text
+https://YOUR-EXISTING-SERVICE.onrender.com/mcp
+```
+
+The MCP server advertises three model-callable tools:
+
+| Tool | Purpose |
+| --- | --- |
+| `get_name` | Returns the valid assigned name `Nova Box` |
+| `calculate` | Evaluates `+`, `-`, `*`, or `/` for operands from -100 to 100 |
+| `identify_shape` | Classifies a base64 PNG as `rectangle`, `triangle`, or `circle` |
+
+The shape tool supports filled and outlined shapes, colored or dark foregrounds,
+uniform backgrounds, transparency, and PNG data URIs. The server instructions
+tell the evaluator's multi-turn agent to compose tools for combination questions
+and never guess.
+
+The MCP implementation is stateless and returns JSON responses, so individual
+tool calls do not depend on process affinity. The FastAPI lifespan starts the MCP
+session manager used by legacy MCP clients, and the SDK also supports the current
+sessionless protocol on the same `/mcp` endpoint.
+
+The server advertises only three concise tools, well below the challenge limit
+of 20, and every tool returns a tiny result well below the 1,200-token limit.
+All computation is local and comfortably inside the 10-second response limit.
+
 ## Add the next challenge
 
-1. Create `app/challenges/<challenge_name>.py` with an `APIRouter` using a unique
-   prefix such as `/<challenge-name>`.
+1. Create `app/challenges/<challenge_name>.py` with either an `APIRouter` for REST
+   or an `MCPServer` when the challenge requires MCP.
 2. Import the module in `app/challenges/__init__.py`.
 3. Register its router in `app/main.py`.
 4. Add an independent test file under `tests/`.
