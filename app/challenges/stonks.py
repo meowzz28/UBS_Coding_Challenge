@@ -76,9 +76,7 @@ def solve_test_case(tc: TestCase) -> List[str]:
             else:
                 optional_sell.append(s)
                 
-        # To avoid 2^N explosion, we only branch on two logical sell states:
-        # A) Hold onto appreciating stocks, sell only what has peaked.
-        # B) Liquidate everything profitable right now to maximize immediate compounding capital.
+        # Branch on sell states
         sell_branches = [must_sell]
         if optional_sell:
             sell_branches.append(must_sell + optional_sell)
@@ -98,8 +96,8 @@ def solve_test_case(tc: TestCase) -> List[str]:
                     new_inv[s] = 0
                     sell_actions.append(f"s-{s}-{q}")
                     
-            # 3. Buy Phase
-            buyable = []
+            # 3. Buy Phase: Exact DP Knapsack
+            buyable_items = []
             for s, q in avail.get(year, {}).items():
                 if q == 0: continue
                 current_p = prices.get(year, {}).get(s, 0)
@@ -113,50 +111,56 @@ def solve_test_case(tc: TestCase) -> List[str]:
                         max_future_p = prices[target_y][s]
                         
                 if max_future_p > current_p:
-                    buyable.append((max_future_p / current_p, max_future_p - current_p, s, current_p))
+                    buyable_items.append((s, current_p, max_future_p - current_p, q))
                     
-            buyable.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            # Run DP to extract the exact optimal packing bounds
+            dp = {0: 0} 
+            combo = {0: {}} 
             
-            buy_branches = []
-            seen_combos = set()
-            
-            # Heuristic Bounded Knapsack: Check greedy configurations starting from each profitable stock 
-            # to prevent permutation timeouts while catching subset edge cases.
-            for start_idx in range(len(buyable)):
-                c = new_cap
-                combo = {}
-                for i in range(start_idx, len(buyable)):
-                    _, _, s, p = buyable[i]
-                    q = min(avail[year].get(s, 0), c // p)
-                    if q > 0:
-                        combo[s] = q
-                        c -= q * p
-                for i in range(0, start_idx):
-                    _, _, s, p = buyable[i]
-                    q = min(avail[year].get(s, 0), c // p)
-                    if q > 0:
-                        combo[s] = q
-                        c -= q * p
-                        
-                combo_tuple = tuple(sorted(combo.items()))
-                if combo_tuple not in seen_combos:
-                    seen_combos.add(combo_tuple)
-                    buy_branches.append((combo, c))
-                    
-            empty_combo = tuple()
-            if empty_combo not in seen_combos:
-                buy_branches.append(({}, new_cap))
-                seen_combos.add(empty_combo)
+            for s, cost, prof, max_q in buyable_items:
+                new_dp = dict(dp)
+                new_combo = dict(combo)
+                for c, p in dp.items():
+                    for q_buy in range(1, max_q + 1):
+                        nxt_c = c + q_buy * cost
+                        if nxt_c <= new_cap:
+                            nxt_p = p + q_buy * prof
+                            if nxt_c not in new_dp or nxt_p > new_dp[nxt_c]:
+                                new_dp[nxt_c] = nxt_p
+                                new_combo[nxt_c] = dict(combo.get(c, {}))
+                                new_combo[nxt_c][s] = q_buy
+                dp = new_dp
+                combo = new_combo
                 
-            for buy_combo, final_cap in buy_branches:
+            # Extract Pareto Frontier
+            sorted_costs = sorted(dp.keys())
+            pareto_combos = []
+            max_p = -1
+            for c in sorted_costs:
+                if dp[c] > max_p:
+                    max_p = dp[c]
+                    pareto_combos.append((c, combo[c]))
+                    
+            # Limit Pareto branches to avoid TLE while catching edge cases
+            if len(pareto_combos) > 10:
+                step = len(pareto_combos) / 9.0
+                sampled = [pareto_combos[int(i * step)] for i in range(9)]
+                if pareto_combos[-1] not in sampled:
+                    sampled.append(pareto_combos[-1])
+                pareto_combos = sampled
+                
+            for cost, buy_combo in pareto_combos:
+                final_cap = new_cap - cost
                 final_avail = {y: dict(v) for y, v in avail.items()}
                 final_inv = dict(new_inv)
                 buy_actions = []
                 
-                for s, q in buy_combo.items():
-                    final_avail[year][s] -= q
-                    final_inv[s] = final_inv.get(s, 0) + q
-                    buy_actions.append(f"b-{s}-{q}")
+                for s in sorted(buy_combo.keys()):
+                    q = buy_combo[s]
+                    if q > 0:
+                        final_avail[year][s] -= q
+                        final_inv[s] = final_inv.get(s, 0) + q
+                        buy_actions.append(f"b-{s}-{q}")
                     
                 current_actions = sell_actions + buy_actions
                 
@@ -175,12 +179,12 @@ def solve_test_case(tc: TestCase) -> List[str]:
                 # 4. Jump Phase
                 for target_y in all_years:
                     if target_y == year: continue
-                    cost = abs(year - target_y)
-                    # Scales linearly and guarantees return to 2037
-                    if cost <= energy - abs(target_y - 2037):
+                    jump_cost = abs(year - target_y)
+                    # Scales linearly and guarantees return home safely[cite: 1]
+                    if jump_cost <= energy - abs(target_y - 2037):
                         dfs(
                             target_y,
-                            energy - cost,
+                            energy - jump_cost,
                             final_cap,
                             final_inv,
                             final_avail,
