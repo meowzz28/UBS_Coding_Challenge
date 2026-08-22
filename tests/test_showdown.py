@@ -641,6 +641,18 @@ def test_phase_three_equity_accounts_for_every_live_opponent() -> None:
     assert six_seat_equity.equity < heads_up_equity.equity
 
 
+def test_phase_three_unknown_rule_uses_a_conservative_hypothesis_ensemble() -> None:
+    state = phase_three_state("never-seen")
+    state.update({"round": "post_reveal", "community_number": 7})
+
+    estimate = _equity_estimate(state, 7, 7)
+
+    assert estimate.observations == 0
+    assert estimate.robust_equity <= estimate.equity
+    assert estimate.robust_percentile <= estimate.percentile
+    assert 0.0 <= estimate.premium_support <= 1.0
+
+
 def test_phase_three_filters_folded_and_busted_seats_but_keeps_all_ins() -> None:
     state = phase_three_state("live-seat-filter")
     state["players"][1]["folded"] = True
@@ -649,7 +661,166 @@ def test_phase_three_filters_folded_and_busted_seats_but_keeps_all_ins() -> None
     estimate = _equity_estimate(state, 7, 7)
 
     assert estimate.opponents == 3
-    assert estimate.equity == pytest.approx(0.25)
+    assert 0.0 < estimate.equity < 1.0
+    assert estimate.robust_equity <= estimate.equity
+
+
+def test_phase_three_uses_official_six_seat_action_order() -> None:
+    state = phase_three_state("position-rule")
+    state["button_seat"] = 0
+
+    state["your_seat"] = 0
+    assert not showdown_module._is_late_position(state, "pre_reveal")
+    assert showdown_module._is_late_position(state, "post_reveal")
+
+    state["your_seat"] = 2
+    assert showdown_module._is_late_position(state, "pre_reveal")
+    assert not showdown_module._is_late_position(state, "post_reveal")
+
+
+def test_phase_three_only_a_strict_chip_majority_is_an_early_hard_lock() -> None:
+    state = phase_three_state("majority-high")
+    state.update(
+        {
+            "hand_number": 20,
+            "round": "post_reveal",
+            "your_number": 13,
+            "community_number": 6,
+            "your_stack": 650,
+            "pot": 50,
+            "to_call": 25,
+            "legal_actions": ["fold", "call", "raise"],
+            "min_raise_to": 50,
+            "max_raise_to": 650,
+            "recent_hands": hidden_multiway_history(
+                lambda number, _community: (number,)
+            ),
+            "current_hand_actions": [
+                {"round": "post_reveal", "seat": 1, "action": "bet", "amount": 25}
+            ],
+        }
+    )
+    state["players"][0].update({"stack": 650, "chip_delta": 450})
+    for player, delta in zip(state["players"][1:], [100, -50, -100, -200, -200]):
+        player["chip_delta"] = delta
+
+    assert decide_move(state) == {"action": "fold"}
+
+
+def test_phase_three_does_not_false_lock_an_ordinary_early_lead() -> None:
+    state = phase_three_state("ordinary-lead-high")
+    state.update(
+        {
+            "hand_number": 18,
+            "round": "post_reveal",
+            "your_number": 13,
+            "community_number": 6,
+            "your_stack": 230,
+            "pot": 40,
+            "to_call": 15,
+            "legal_actions": ["fold", "call", "raise"],
+            "min_raise_to": 30,
+            "max_raise_to": 230,
+            "recent_hands": hidden_multiway_history(
+                lambda number, _community: (number,)
+            ),
+            "current_hand_actions": [
+                {"round": "post_reveal", "seat": 1, "action": "bet", "amount": 15}
+            ],
+        }
+    )
+    state["players"][0].update({"stack": 230, "chip_delta": 30})
+    for player, delta in zip(state["players"][1:], [10, 5, -5, -15, -25]):
+        player["chip_delta"] = delta
+
+    assert decide_move(state)["action"] == "raise"
+
+
+def test_phase_three_intercepts_an_exposed_early_chip_leader_with_the_nuts() -> None:
+    state = phase_three_state("leader-high")
+    state.update(
+        {
+            "hand_number": 15,
+            "round": "post_reveal",
+            "your_number": 13,
+            "community_number": 6,
+            "your_stack": 200,
+            "pot": 80,
+            "to_call": 30,
+            "legal_actions": ["fold", "call", "raise"],
+            "min_raise_to": 60,
+            "max_raise_to": 200,
+            "recent_hands": hidden_multiway_history(
+                lambda number, _community: (number,)
+            ),
+            "current_hand_actions": [
+                {"round": "post_reveal", "seat": 1, "action": "bet", "amount": 30}
+            ],
+        }
+    )
+    for player, delta in zip(state["players"], [0, 100, -10, -20, -30, -40]):
+        player["chip_delta"] = delta
+
+    assert decide_move(state) == {"action": "raise", "amount": 200}
+
+
+def test_phase_three_checks_a_merely_average_hand_into_five_ranges() -> None:
+    state = phase_three_state("multiway-value-high")
+    state.update(
+        {
+            "hand_number": 18,
+            "round": "post_reveal",
+            "your_number": 9,
+            "community_number": 6,
+            "pot": 24,
+            "to_call": 0,
+            "legal_actions": ["check", "bet"],
+            "min_raise_to": 2,
+            "max_raise_to": 200,
+            "recent_hands": hidden_multiway_history(
+                lambda number, _community: (number,)
+            ),
+            "current_hand_actions": [],
+        }
+    )
+
+    assert decide_move(state) == {"action": "check"}
+
+
+def test_phase_three_respects_tag_range_but_calls_a_maniac_heads_up() -> None:
+    def facing(name_seat: int) -> dict[str, Any]:
+        state = phase_three_state("range-high")
+        state.update(
+            {
+                "hand_number": 24,
+                "round": "post_reveal",
+                "your_number": 11,
+                "community_number": 6,
+                "your_stack": 200,
+                "pot": 120,
+                "to_call": 80,
+                "legal_actions": ["fold", "call"],
+                "min_raise_to": None,
+                "max_raise_to": None,
+                "recent_hands": hidden_multiway_history(
+                    lambda number, _community: (number,)
+                ),
+                "current_hand_actions": [
+                    {
+                        "round": "post_reveal",
+                        "seat": name_seat,
+                        "action": "bet",
+                        "amount": 80,
+                    }
+                ],
+            }
+        )
+        for player in state["players"][1:]:
+            player["folded"] = player["seat"] != name_seat
+        return state
+
+    assert decide_move(facing(1)) == {"action": "fold"}  # Dana: TAG prior
+    assert decide_move(facing(5)) == {"action": "call"}  # Bram: maniac prior
 
 
 def test_phase_three_protects_a_qualifying_strict_late_lead() -> None:
@@ -756,7 +927,8 @@ def test_phase_three_midgame_steals_from_late_position() -> None:
     state.update(
         {
             "hand_number": 30,
-            "button_seat": 0,
+            # With button 4, seat 0 is the big blind and acts last before reveal.
+            "button_seat": 4,
             "round": "pre_reveal",
             "your_number": 7,
             "community_number": None,
@@ -770,6 +942,8 @@ def test_phase_three_midgame_steals_from_late_position() -> None:
             ),
         }
     )
+    for player in state["players"][1:4]:
+        player["folded"] = True
     result = decide_move(state)
 
     assert result["action"] == "bet"

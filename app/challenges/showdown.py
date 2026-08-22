@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any, Literal, TypedDict, cast
@@ -28,7 +28,7 @@ def _target_under_rank(number: int, community: int, target: int) -> RankKey:
 
 def _target_nearest_rank(number: int, community: int, target: int) -> RankKey:
     total = number + community
-    return (float(-abs(total - target)), float(total))
+    return (float(-abs(total - target)),)
 
 
 RULE_HYPOTHESES: dict[str, Ranker] = {
@@ -86,8 +86,24 @@ RULE_HYPOTHESES: dict[str, Ranker] = {
     "target-14-nearest": lambda number, community: _target_nearest_rank(
         number, community, 14
     ),
+    "target-14-nearest-high": lambda number, community: (
+        *_target_nearest_rank(number, community, 14),
+        float(number + community),
+    ),
+    "target-14-nearest-low": lambda number, community: (
+        *_target_nearest_rank(number, community, 14),
+        float(-(number + community)),
+    ),
     "target-21-nearest": lambda number, community: _target_nearest_rank(
         number, community, 21
+    ),
+    "target-21-nearest-high": lambda number, community: (
+        *_target_nearest_rank(number, community, 21),
+        float(number + community),
+    ),
+    "target-21-nearest-low": lambda number, community: (
+        *_target_nearest_rank(number, community, 21),
+        float(-(number + community)),
     ),
 }
 
@@ -130,6 +146,9 @@ class EquityEstimate:
     opponents: int = 1
     percentile: float = 0.5
     locked_rule: str | None = None
+    robust_equity: float = 0.0
+    robust_percentile: float = 0.0
+    premium_support: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -287,7 +306,18 @@ def _equity_estimate(
             if community is not None
             else pre_reveal_equity(your_number)
         )
-        return EquityEstimate(equity, 1.0, 100, "standard", 1, equity, "standard")
+        return EquityEstimate(
+            equity,
+            1.0,
+            100,
+            "standard",
+            1,
+            equity,
+            "standard",
+            equity,
+            equity,
+            float(equity >= 0.75),
+        )
 
     rule_name = str(state.get("table_rule", ""))
     _remember_showdowns(state, rule_name)
@@ -295,17 +325,63 @@ def _equity_estimate(
     learned = _learn_rule_model(rule_name, observations)
     opponents = _live_opponent_count(state)
 
-    if community is None:
-        estimates = [
-            _exact_multiway_equity(learned, your_number, revealed, opponents)
-            for revealed in range(1, 14)
-        ]
-        total = sum(item[0] for item in estimates) / 13
-        percentile = sum(item[1] for item in estimates) / 13
-    else:
-        total, percentile = _exact_multiway_equity(
-            learned, your_number, community, opponents
+    if phase != 3 and learned.observations == 0:
+        fair_share = 1.0 / (opponents + 1)
+        return EquityEstimate(
+            fair_share,
+            learned.confidence,
+            0,
+            EXACT_MODEL_NAME,
+            opponents,
+            0.5,
+            None,
+            fair_share,
+            0.5,
+            0.0,
         )
+
+    if learned.candidates:
+        # Preserve each rule as one coherent world while averaging across the
+        # unknown community number. Taking a minimum independently on every
+        # community mixes mutually exclusive rules and is needlessly pessimistic.
+        by_rule: list[tuple[float, float]] = []
+        for candidate in learned.candidates:
+            ranker = RULE_HYPOTHESES[candidate]
+            if community is None:
+                values = [
+                    _ranker_equity(ranker, your_number, revealed, opponents)
+                    for revealed in range(1, 14)
+                ]
+                by_rule.append(
+                    (
+                        sum(value[0] for value in values) / 13,
+                        sum(value[1] for value in values) / 13,
+                    )
+                )
+            else:
+                by_rule.append(
+                    _ranker_equity(ranker, your_number, community, opponents)
+                )
+        total = sum(item[0] for item in by_rule) / len(by_rule)
+        percentile = sum(item[1] for item in by_rule) / len(by_rule)
+        robust_equity = _lower_quartile(item[0] for item in by_rule)
+        robust_percentile = _lower_quartile(item[1] for item in by_rule)
+        premium_support = sum(item[1] >= 0.75 for item in by_rule) / len(by_rule)
+    else:
+        if community is None:
+            estimates = [
+                _exact_multiway_equity(learned, your_number, revealed, opponents)
+                for revealed in range(1, 14)
+            ]
+            total = sum(item[0] for item in estimates) / 13
+            percentile = sum(item[1] for item in estimates) / 13
+        else:
+            total, percentile = _exact_multiway_equity(
+                learned, your_number, community, opponents
+            )
+        robust_equity = total
+        robust_percentile = percentile
+        premium_support = float(percentile >= 0.75)
     return EquityEstimate(
         total,
         learned.confidence,
@@ -314,6 +390,9 @@ def _equity_estimate(
         opponents,
         percentile,
         learned.locked_rule,
+        robust_equity,
+        robust_percentile,
+        premium_support,
     )
 
 
@@ -553,8 +632,6 @@ def _exact_multiway_equity(
 
     opponents = max(1, opponents)
     fair_share = 1.0 / (opponents + 1)
-    if model.observations == 0:
-        return fair_share, 0.5
     if model.candidates:
         values = [
             _ranker_equity(RULE_HYPOTHESES[name], your_number, community, opponents)
@@ -581,6 +658,15 @@ def _exact_multiway_equity(
         fair_share + (raw - fair_share) * reliability,
         0.5 + (known_percentile - 0.5) * reliability,
     )
+
+
+def _lower_quartile(values: Iterable[float]) -> float:
+    """Return a deterministic lower quartile without interpolation."""
+
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        return 0.0
+    return ordered[(len(ordered) - 1) // 4]
 
 
 def _learning_move(
@@ -647,147 +733,236 @@ def _phase_three_move(
     profile: OpponentProfile,
     estimate: EquityEstimate,
 ) -> Move:
-    """Three-stage Phase 3 policy optimized for finishing strictly first."""
+    """Rank-first six-seat policy with exact rule and range-aware risk control."""
 
     equity = estimate.equity
     percentile = estimate.percentile
-    fair_share = 1.0 / (estimate.opponents + 1)
     round_name = str(state.get("round", "pre_reveal"))
-    hand = _int(state.get("hand_number"), 1)
+    hand = max(1, _int(state.get("hand_number"), 1))
+    total_hands = max(hand, _int(state.get("total_hands"), 60))
+    remaining = total_hands - hand
     own_delta, leader_delta, leader_seat = _leaderboard(state)
     lead = own_delta - leader_delta
+    deficit = max(0, leader_delta - own_delta + 1, 10 - own_delta)
     target_seat = _last_aggressor_seat(state)
+    leader_exposed = _leader_is_exposed(state, leader_seat, target_seat)
     late_position = _is_late_position(state, round_name)
-    actions = _actions(state.get("current_hand_actions"))
-    has_raise = any(
-        str(action.get("action", "")) in AGGRESSIVE_ACTIONS for action in actions
+    round_actions = [
+        action
+        for action in _actions(state.get("current_hand_actions"))
+        if str(action.get("round", "")) == round_name
+    ]
+    your_seat = _int(state.get("your_seat"), -1)
+    aggression_count = sum(
+        str(action.get("action", "")) in AGGRESSIVE_ACTIONS
+        and _int(action.get("seat"), -2) != your_seat
+        for action in round_actions
     )
-    pair = isinstance(state.get("community_number"), int) and state.get(
-        "your_number"
-    ) == state.get("community_number")
+    has_raise = aggression_count > 0
+    risk = to_call / max(1, stack)
+    price = _pot_odds(to_call, pot)
+    monster = percentile >= 0.95
 
-    # Phase C: protect a qualifying 12-chip lead. When behind, top-quartile
-    # holdings attack the chip leader because second place has no value.
-    if hand >= 46 and own_delta >= 10 and lead >= 12:
-        monster = percentile >= 0.94 or (pair and percentile >= 0.80)
-        if not monster:
-            if to_call > 0:
-                return _first_legal(legal, "fold", "call", "check")
-            return _first_legal(legal, "check", "call", "fold")
+    # More than half of every chip at the table is the only truly uncatchable
+    # lead. Checking/folding from here guarantees both a unique rank one and +10.
+    if _strict_majority_locked(state, stack, own_delta) or _final_hand_rank_locked(
+        state, stack, own_delta
+    ):
         if to_call > 0:
-            return _first_legal(legal, "call", "check", "fold")
-        if _can_aggress(legal):
-            return _aggressive_move(state, legal, own_bet, 0, pot, 0.50)
+            return _first_legal(legal, "fold", "call", "check")
         return _first_legal(legal, "check", "call", "fold")
 
-    trailing = hand >= 46 and (lead < 0 or own_delta < 10)
-    if trailing and percentile >= 0.75:
-        urgent = hand >= 55 or max(0, -lead, 10 - own_delta) >= 12
-        if _can_aggress(legal) and (
-            target_seat == leader_seat or to_call == 0 or percentile >= 0.86
-        ):
+    # Near the finish, protect a lead only when its cushion is meaningful for the
+    # hands left. A fixed 12-chip threshold was the main source of false locks.
+    protect_cushion = max(10, remaining * 3)
+    protecting = hand >= 52 and own_delta >= 10 and lead >= protect_cushion
+    if protecting and not monster:
+        if to_call > 0:
+            return _first_legal(legal, "fold", "call", "check")
+        return _first_legal(legal, "check", "call", "fold")
+
+    # Until the rule is identified, distinguish cheap information from a blind
+    # gamble. The lower-quartile estimate permits a large call only when the hand
+    # is strong under most surviving mathematical rules, not merely their mean.
+    if estimate.locked_rule is None and estimate.observations < 8:
+        if to_call == 0:
+            if (
+                round_name == "post_reveal"
+                and estimate.robust_percentile >= 0.78
+                and estimate.premium_support >= 0.70
+                and _can_aggress(legal)
+            ):
+                return _aggressive_move(state, legal, own_bet, 0, pot, 0.52)
+            return _first_legal(legal, "check", "call", "fold")
+        learning_cap = max(3, min(round(pot * 0.65), round(stack * 0.07), 10))
+        robust_call = (
+            estimate.premium_support >= 0.75
+            and estimate.robust_percentile >= 0.68
+            and estimate.robust_equity >= price + 0.02
+            and risk <= 0.35
+        )
+        if "call" in legal and (to_call <= learning_cap or robust_call):
+            return {"action": "call"}
+        return _first_legal(legal, "fold", "call", "check")
+
+    # A large leader must be challenged while enough hands remain. Waiting until
+    # hand 46 allowed one opponent to absorb the table before we took any risk.
+    catching_up = deficit >= 35 or (hand >= 46 and deficit > 0)
+    if catching_up and leader_exposed and percentile >= 0.88:
+        if _can_aggress(legal):
+            all_in = percentile >= 0.95 and (deficit >= 70 or hand >= 52)
             return _aggressive_move(
                 state,
                 legal,
                 own_bet,
                 to_call,
                 pot,
-                1.20,
-                all_in=urgent,
+                1.10,
+                all_in=all_in,
             )
-        if to_call > 0:
+        if to_call > 0 and equity >= price - 0.01:
             return _first_legal(legal, "call", "fold", "check")
 
-    # Candidate-ensemble equity is useful immediately, but buy cheap labelled
-    # showdowns until the hypothesis engine locks or the DAG has enough evidence.
-    if estimate.locked_rule is None and estimate.observations < 8:
-        if to_call == 0:
-            return _first_legal(legal, "check", "call", "fold")
-        learning_cap = max(3, min(round(pot * 0.65), round(stack * 0.07), 10))
-        if "call" in legal and to_call <= learning_cap:
-            return {"action": "call"}
-        return _first_legal(legal, "fold", "call", "check")
-
-    # Phase A: never fold top-30% holdings to the known hyper-aggressive seats
-    # solely because the wager is large; trap or reshove instead.
+    # The two empirically loose seats can put stacks in during the opening hands.
+    # Multiway pressure raises the threshold because top 30% heads-up is not top
+    # 30% against four additional live ranges.
     if hand <= 20 and to_call > 0 and profile.archetype == "maniac":
-        if percentile >= 0.86 and _can_aggress(legal):
+        maniac_floor = 0.76 if estimate.opponents >= 3 else 0.68
+        if percentile >= 0.90 and _can_aggress(legal):
             return _aggressive_move(
-                state, legal, own_bet, to_call, pot, 1.0, all_in=True
+                state,
+                legal,
+                own_bet,
+                to_call,
+                pot,
+                1.05,
+                all_in=monster or (estimate.opponents <= 2 and percentile >= 0.92),
             )
-        if percentile >= 0.70:
+        if percentile >= maniac_floor and equity >= price - 0.035:
             return _first_legal(legal, "call", "fold", "check")
 
     if round_name == "post_reveal":
         if to_call > 0:
-            price = _pot_odds(to_call, pot)
-            risk = to_call / max(1, stack)
-            if profile.archetype == "maniac" and percentile >= 0.65:
+            range_floor = _showdown_call_floor(
+                profile,
+                aggression_count,
+                risk,
+                estimate.opponents,
+                catching_up and leader_exposed,
+            )
+            if monster:
+                if _can_aggress(legal):
+                    all_in = (
+                        profile.archetype == "maniac"
+                        or leader_exposed
+                        or pot >= stack // 3
+                    )
+                    return _aggressive_move(
+                        state,
+                        legal,
+                        own_bet,
+                        to_call,
+                        pot,
+                        1.15,
+                        all_in=all_in,
+                    )
                 return _first_legal(legal, "call", "fold", "check")
-            if profile.archetype == "lag" and percentile >= 0.70:
-                return _first_legal(legal, "call", "fold", "check")
-            if profile.archetype == "tag" and risk >= 0.15 and percentile < 0.85:
-                return _first_legal(legal, "fold", "call", "check")
-            if percentile >= 0.90 and _can_aggress(legal):
+            if percentile >= 0.88 and _can_aggress(legal) and risk <= 0.45:
                 return _aggressive_move(
-                    state,
-                    legal,
-                    own_bet,
-                    to_call,
-                    pot,
-                    0.85,
-                    all_in=profile.archetype == "maniac" and hand <= 20,
+                    state, legal, own_bet, to_call, pot, 0.82
                 )
             tendency_bonus = _clamp(
-                (profile.aggression_factor - 1.5) * 0.018,
-                -0.03,
-                0.08,
+                (profile.aggression_factor - 1.5) * 0.015,
+                -0.025,
+                0.055,
             )
-            if "call" in legal and equity + tendency_bonus >= price + 0.025:
+            margin = 0.015 if catching_up else 0.035
+            if (
+                "call" in legal
+                and percentile >= range_floor
+                and equity + tendency_bonus >= price + margin
+            ):
                 return {"action": "call"}
             return _first_legal(legal, "fold", "call", "check")
 
-        value_threshold = (
-            0.62 if hand <= 20 else 0.56 if estimate.opponents <= 2 else 0.68
-        )
+        # A percentile that is fine heads-up is a value leak into five ranges.
+        # Scale the opening threshold with the number of live opponents.
+        value_thresholds = {1: 0.62, 2: 0.74, 3: 0.82, 4: 0.86, 5: 0.89}
+        value_threshold = value_thresholds.get(min(5, estimate.opponents), 0.89)
+        if catching_up:
+            value_threshold -= 0.03
         if percentile >= value_threshold and _can_aggress(legal):
-            fraction = 0.65 if percentile >= 0.82 else 0.52
+            fraction = 0.82 if percentile >= 0.90 else 0.55
             return _aggressive_move(state, legal, own_bet, 0, pot, fraction)
-        if (
-            21 <= hand <= 45
+        steal = (
+            21 <= hand <= 50
             and late_position
-            and percentile >= 0.42
+            and estimate.opponents <= 2
+            and not _has_all_in_opponent(state)
             and _can_aggress(legal)
-        ):
+            and (
+                percentile >= 0.43
+                or profile.fold_to_raise >= 0.50
+                or _mix(state, "position-steal") < 0.26
+            )
+        )
+        if steal:
             return _aggressive_move(state, legal, own_bet, 0, pot, 0.50)
         return _first_legal(legal, "check", "call", "fold")
 
-    # Phase B: widen in short-handed pots and use the button/cutoff to steal.
+    # Before the reveal, a raise describes a range but the community is still
+    # unknown. Reserve stack-sized confrontations for the very top of exact
+    # pre-reveal equity; enter cheaply with hands that retain sufficient pot odds.
     cheap_entry = to_call <= max(2, _int(state.get("big_blind"), 2)) and not has_raise
     if to_call > 0:
-        price = _pot_odds(to_call, pot)
-        if percentile >= 0.84 and _can_aggress(legal):
-            return _aggressive_move(state, legal, own_bet, to_call, pot, 0.65)
-        if cheap_entry and percentile >= 0.42 and "call" in legal:
+        range_floor = _showdown_call_floor(
+            profile,
+            aggression_count,
+            risk,
+            estimate.opponents,
+            catching_up and leader_exposed,
+        )
+        range_floor = max(0.55, range_floor - 0.04)
+        if percentile >= 0.91 and _can_aggress(legal):
+            return _aggressive_move(
+                state,
+                legal,
+                own_bet,
+                to_call,
+                pot,
+                0.88,
+                all_in=percentile >= 0.96
+                and (leader_exposed or profile.archetype == "maniac"),
+            )
+        if cheap_entry and percentile >= 0.40 and "call" in legal:
             return {"action": "call"}
-        if "call" in legal and equity >= price + (0.02 if late_position else 0.05):
+        if (
+            "call" in legal
+            and percentile >= range_floor
+            and equity >= price + (0.01 if catching_up else 0.035)
+        ):
             return {"action": "call"}
         return _first_legal(legal, "fold", "call", "check")
 
+    opening_thresholds = {1: 0.64, 2: 0.70, 3: 0.77, 4: 0.81, 5: 0.84}
+    opening_threshold = opening_thresholds.get(min(5, estimate.opponents), 0.84)
     steal = (
-        21 <= hand <= 45
+        21 <= hand <= 50
         and late_position
+        and estimate.opponents <= 3
+        and not _has_all_in_opponent(state)
         and _can_aggress(legal)
         and (
-            percentile >= 0.40
-            or profile.fold_to_raise >= 0.48
-            or _mix(state, "position-steal") < 0.38
+            percentile >= 0.45
+            or profile.fold_to_raise >= 0.52
+            or _mix(state, "position-steal") < 0.24
         )
     )
     if steal:
-        return _aggressive_move(state, legal, own_bet, 0, pot, 0.52)
-    if percentile >= max(0.70, 1.0 - fair_share) and _can_aggress(legal):
-        return _aggressive_move(state, legal, own_bet, 0, pot, 0.55)
+        return _aggressive_move(state, legal, own_bet, 0, pot, 0.50)
+    if percentile >= opening_threshold and _can_aggress(legal):
+        fraction = 0.72 if percentile >= 0.90 else 0.52
+        return _aggressive_move(state, legal, own_bet, 0, pot, fraction)
     return _first_legal(legal, "check", "call", "fold")
 
 
@@ -1113,20 +1288,160 @@ def _leaderboard(state: Mapping[str, Any]) -> tuple[int, int, int | None]:
     return own_delta, leader_delta, leader_seat
 
 
+def _leader_is_exposed(
+    state: Mapping[str, Any],
+    leader_seat: int | None,
+    aggressor_seat: int | None,
+) -> bool:
+    """Whether the current pot offers a direct chance to take the leader's chips."""
+
+    if leader_seat is None:
+        return False
+    if aggressor_seat == leader_seat:
+        return True
+    for action in reversed(_actions(state.get("current_hand_actions"))):
+        if _int(action.get("seat"), -2) != leader_seat:
+            continue
+        return str(action.get("action", "")) in {"call", "bet", "raise"}
+    players = state.get("players")
+    if not isinstance(players, Sequence) or isinstance(players, (str, bytes)):
+        return False
+    for player in players:
+        if not isinstance(player, Mapping):
+            continue
+        if _int(player.get("seat"), -2) != leader_seat:
+            continue
+        return (
+            player.get("folded") is not True
+            and player.get("busted") is not True
+            and player.get("all_in") is True
+        )
+    return False
+
+
+def _strict_majority_locked(
+    state: Mapping[str, Any], live_stack: int, own_delta: int
+) -> bool:
+    """A strict chip majority cannot be overtaken even if opponents consolidate."""
+
+    if own_delta < 10:
+        return False
+    players = state.get("players")
+    if not isinstance(players, Sequence) or isinstance(players, (str, bytes)):
+        return False
+    seats = sum(isinstance(player, Mapping) for player in players)
+    if seats < 2:
+        return own_delta >= 10
+    starting_stack = max(1, _int(state.get("starting_stack"), 200))
+    total_chips = seats * starting_stack
+    return live_stack * 2 > total_chips
+
+
+def _final_hand_rank_locked(
+    state: Mapping[str, Any], live_stack: int, own_delta: int
+) -> bool:
+    """Whether folding/checking guarantees rank one after the current final hand."""
+
+    hand = _int(state.get("hand_number"), 0)
+    total_hands = _int(state.get("total_hands"), 0)
+    if hand < 1 or hand != total_hands or own_delta < 10:
+        return False
+    your_seat = _int(state.get("your_seat"), -1)
+    pot = max(0, _int(state.get("pot"), 0))
+    players = state.get("players")
+    if not isinstance(players, Sequence) or isinstance(players, (str, bytes)):
+        return False
+    worst_opponent = 0
+    for player in players:
+        if not isinstance(player, Mapping):
+            continue
+        if _int(player.get("seat"), -2) == your_seat:
+            continue
+        opponent_stack = max(0, _int(player.get("stack"), 0))
+        can_win_pot = (
+            player.get("folded") is not True and player.get("busted") is not True
+        )
+        worst_opponent = max(
+            worst_opponent,
+            opponent_stack + (pot if can_win_pot else 0),
+        )
+    return live_stack > worst_opponent
+
+
+def _has_all_in_opponent(state: Mapping[str, Any]) -> bool:
+    your_seat = _int(state.get("your_seat"), -1)
+    players = state.get("players")
+    if not isinstance(players, Sequence) or isinstance(players, (str, bytes)):
+        return False
+    return any(
+        isinstance(player, Mapping)
+        and _int(player.get("seat"), -2) != your_seat
+        and player.get("folded") is not True
+        and player.get("busted") is not True
+        and player.get("all_in") is True
+        for player in players
+    )
+
+
+def _showdown_call_floor(
+    profile: OpponentProfile,
+    aggression_count: int,
+    risk: float,
+    opponents: int,
+    leader_opportunity: bool,
+) -> float:
+    """Minimum rule percentile needed against the observed betting range."""
+
+    base = {
+        "maniac": 0.63,
+        "lag": 0.70,
+        "tag": 0.82,
+        "mixed": 0.75,
+        "unknown": 0.76,
+    }.get(profile.archetype, 0.76)
+    base += 0.055 * max(0, aggression_count - 1)
+    base += 0.045 if risk >= 0.35 else 0.02 if risk >= 0.18 else 0.0
+    base += 0.025 if opponents >= 3 else 0.0
+    if leader_opportunity:
+        base -= 0.035
+    return _clamp(base, 0.58, 0.93)
+
+
 def _is_late_position(state: Mapping[str, Any], round_name: str) -> bool:
     your_seat = _int(state.get("your_seat"), -1)
     button = _int(state.get("button_seat"), -2)
     if your_seat < 0 or button < 0:
         return False
+    players = state.get("players")
+    if not isinstance(players, Sequence) or isinstance(players, (str, bytes)):
+        return False
+    seated: list[int] = []
+    acting: set[int] = set()
+    for player in players:
+        if not isinstance(player, Mapping) or player.get("busted") is True:
+            continue
+        seat = _int(player.get("seat"), -1)
+        if seat < 0:
+            continue
+        seated.append(seat)
+        if player.get("folded") is not True and player.get("all_in") is not True:
+            acting.add(seat)
+    seated.sort()
+    if not seated or button not in seated or your_seat not in acting:
+        return False
+
+    button_index = seated.index(button)
     if round_name == "post_reveal":
-        return your_seat == button
-    active = sorted(
-        seat for seat, (_name, busted) in _player_maps(state).items() if not busted
-    )
-    if your_seat == button or not active:
-        return True
-    previous = max((seat for seat in active if seat < button), default=max(active))
-    return your_seat == previous
+        start_index = (button_index + 1) % len(seated)
+        late_count = 1
+    else:
+        # The first pre-reveal actor sits immediately after the big blind, the
+        # second live seat past the button. This also handles busted-seat skips.
+        start_index = (button_index + 3) % len(seated)
+        late_count = 2
+    order = seated[start_index:] + seated[:start_index]
+    remaining_order = [seat for seat in order if seat in acting]
+    return your_seat in set(remaining_order[-late_count:])
 
 
 def _aggressive_move(
