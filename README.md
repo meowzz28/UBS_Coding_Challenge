@@ -171,13 +171,18 @@ The MCP server advertises three model-callable tools:
 | Tool | Purpose |
 | --- | --- |
 | `get_name` | Returns the valid assigned name `Nova Box` |
-| `calculate` | Evaluates `+`, `-`, `*`, or `/` for operands from -100 to 100 |
+| `calculate` | Evaluates a complete `+`, `-`, `*`, `/` expression with precedence |
 | `identify_shape` | Classifies a base64 PNG as `rectangle`, `triangle`, or `circle` |
 
 The shape tool supports filled and outlined shapes, colored or dark foregrounds,
 uniform backgrounds, transparency, and PNG data URIs. The server instructions
 tell the evaluator's multi-turn agent to compose tools for combination questions
 and never guess.
+
+Arithmetic expressions are submitted to `calculate` in one call. The evaluator
+supports parentheses and standard multiplication/division precedence, while a
+restricted Python AST prevents function calls, names, or unsupported operators.
+Every integer literal must remain within the Phase 1 range of -100 to 100.
 
 The MCP implementation is stateless and returns JSON responses, so individual
 tool calls do not depend on process affinity. The FastAPI lifespan starts the MCP

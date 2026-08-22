@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import binascii
 import math
 import statistics
+from fractions import Fraction
 from io import BytesIO
 from typing import Annotated, Literal
 
@@ -19,18 +21,22 @@ from pydantic import Field
 ASSISTANT_NAME = "Nova Box"
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_IMAGE_DIMENSION = 2048
+MAX_EXPRESSION_LENGTH = 200
+MAX_OPERATIONS = 20
 
 server = MCPServer(
     name="UBS Tool Box",
     title="Tool Box Phase 1",
     description="Basic tools for identity, arithmetic, and PNG shape recognition.",
     instructions=(
-        "Use get_name when asked for your name, calculate for arithmetic, and "
-        "identify_shape for base64-encoded PNG images. Combine these tools when "
-        "a request contains more than one kind of task. Return the tool results "
-        "directly and do not guess."
+        "Use get_name when asked for your name. For every arithmetic question, "
+        "call calculate exactly once with the entire expression; it applies "
+        "standard precedence and parentheses, so never split an expression into "
+        "sequential calls or evaluate it left-to-right. Use identify_shape for "
+        "base64-encoded PNG images. Combine these tools when a request contains "
+        "more than one kind of task. Return tool results directly and do not guess."
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -43,24 +49,74 @@ def get_name() -> str:
 
 @server.tool()
 def calculate(
-    left: Annotated[int, Field(ge=-100, le=100, description="Left integer operand")],
-    operator: Annotated[
-        Literal["+", "-", "*", "/"],
-        Field(description="One arithmetic operator: +, -, *, or /"),
+    expression: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=MAX_EXPRESSION_LENGTH,
+            description=(
+                "The complete arithmetic expression, such as '2 + 3 * 5'. "
+                "Pass all operators in one call; standard precedence is automatic."
+            ),
+        ),
     ],
-    right: Annotated[int, Field(ge=-100, le=100, description="Right integer operand")],
 ) -> int | float:
-    """Calculate one binary arithmetic expression using integers from -100 to 100."""
+    """Evaluate a complete arithmetic expression with standard operator precedence."""
 
-    if operator == "+":
-        return left + right
-    if operator == "-":
-        return left - right
-    if operator == "*":
-        return left * right
-    if right == 0:
-        raise ValueError("division by zero is undefined")
-    return left / right
+    normalized = expression.strip().rstrip("?").strip()
+    lowered = normalized.lower()
+    for prefix in ("what is ", "calculate ", "compute "):
+        if lowered.startswith(prefix):
+            normalized = normalized[len(prefix) :].strip()
+            break
+    normalized = normalized.replace("×", "*").replace("÷", "/").replace("−", "-")
+
+    try:
+        parsed = ast.parse(normalized, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError("expression must contain valid arithmetic") from exc
+
+    value = _evaluate_expression_node(parsed.body, [0])
+    if value.denominator == 1:
+        return value.numerator
+    return float(value)
+
+
+def _evaluate_expression_node(node: ast.AST, operation_count: list[int]) -> Fraction:
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bool) or not isinstance(node.value, int):
+            raise ValueError("operands must be integers")
+        if not -100 <= node.value <= 100:
+            raise ValueError("each integer operand must be between -100 and 100")
+        return Fraction(node.value)
+
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        value = _evaluate_expression_node(node.operand, operation_count)
+        return value if isinstance(node.op, ast.UAdd) else -value
+
+    if isinstance(node, ast.BinOp) and isinstance(
+        node.op,
+        (ast.Add, ast.Sub, ast.Mult, ast.Div),
+    ):
+        operation_count[0] += 1
+        if operation_count[0] > MAX_OPERATIONS:
+            raise ValueError(
+                f"expression cannot contain more than {MAX_OPERATIONS} operations"
+            )
+
+        left = _evaluate_expression_node(node.left, operation_count)
+        right = _evaluate_expression_node(node.right, operation_count)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if right == 0:
+            raise ValueError("division by zero is undefined")
+        return left / right
+
+    raise ValueError("only integers, parentheses, and +, -, *, / are supported")
 
 
 @server.tool()

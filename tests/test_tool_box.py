@@ -45,19 +45,36 @@ def test_name_meets_phase_1_constraints() -> None:
 
 
 def test_all_arithmetic_operators() -> None:
-    assert calculate(2, "+", 2) == 4
-    assert calculate(7, "-", 10) == -3
-    assert calculate(-4, "*", 5) == -20
-    assert calculate(7, "/", 2) == 3.5
+    assert calculate("2 + 2") == 4
+    assert calculate("7 - 10") == -3
+    assert calculate("-4 * 5") == -20
+    assert calculate("7 / 2") == 3.5
+
+
+def test_complete_expression_uses_standard_precedence() -> None:
+    assert calculate("2 + 3 * 5") == 17
+    assert calculate("(2 + 3) * 5") == 25
+    assert calculate("100 / -4 + 3 * 2") == -19
+    assert calculate("What is 2 + 3 * 5?") == 17
 
 
 def test_division_by_zero_has_a_clear_error() -> None:
     try:
-        calculate(2, "/", 0)
+        calculate("2 / 0")
     except ValueError as exc:
         assert str(exc) == "division by zero is undefined"
     else:
         raise AssertionError("division by zero should fail")
+
+
+def test_calculator_rejects_non_phase_1_syntax() -> None:
+    for expression in ("2 ** 3", "101 + 1", "1.5 + 2", "sum([1, 2])"):
+        try:
+            calculate(expression)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"unsupported expression was accepted: {expression}")
 
 
 def test_filled_and_outlined_shapes_are_identified() -> None:
@@ -84,18 +101,17 @@ def test_mcp_server_lists_and_calls_tools() -> None:
                 tool for tool in listed.tools if tool.name == "calculate"
             )
             properties = calculate_tool.input_schema["properties"]
-            assert properties["left"]["minimum"] == -100
-            assert properties["right"]["maximum"] == 100
-            assert properties["operator"]["enum"] == ["+", "-", "*", "/"]
+            assert set(properties) == {"expression"}
+            assert "standard precedence" in properties["expression"]["description"]
 
             name_result = await client.call_tool("get_name", {})
             assert name_result.structured_content == {"result": ASSISTANT_NAME}
 
             math_result = await client.call_tool(
                 "calculate",
-                {"left": 12, "operator": "*", "right": -3},
+                {"expression": "2 + 3 * 5"},
             )
-            assert math_result.structured_content == {"result": -36}
+            assert math_result.structured_content == {"result": 17}
 
             shape_result = await client.call_tool(
                 "identify_shape",
