@@ -13,10 +13,11 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     async with tool_box.server.session_manager.run():
         yield
 
+
 app = FastAPI(
     title="UBS Coding Challenge Server",
     description="One deployable FastAPI service containing independent challenge routers.",
-    version="7.1.0",
+    version="8.0.0",
     lifespan=lifespan,
 )
 

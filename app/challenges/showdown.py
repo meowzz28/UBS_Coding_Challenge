@@ -13,30 +13,8 @@ from fastapi import APIRouter
 
 Action = Literal["check", "call", "bet", "raise", "fold"]
 AGGRESSIVE_ACTIONS = {"bet", "raise"}
-RULE_CANDIDATES = (
-    "standard",
-    "pair_low",
-    "high_card",
-    "low_card",
-    "pair_bad_high",
-    "pair_bad_low",
-    "closest_split",
-    "closest_high",
-    "closest_low",
-    "farthest_split",
-    "farthest_high",
-    "farthest_low",
-    "center_split",
-    "center_high",
-    "center_low",
-    "extreme_split",
-    "extreme_high",
-    "extreme_low",
-    "community_switch",
-    "community_switch_inverse",
-    "clockwise",
-    "counterclockwise",
-)
+PRIME_NUMBERS = frozenset({2, 3, 5, 7, 11, 13})
+FEATURE_MODEL_NAME = "feature-linear-v1"
 
 
 class Move(TypedDict, total=False):
@@ -69,8 +47,21 @@ class EquityEstimate:
     model: str
 
 
+@dataclass(frozen=True)
+class LearnedRuleModel:
+    """A deterministic pairwise preference model for one opaque table rule."""
+
+    weights: tuple[float, ...]
+    confidence: float
+    observations: int
+    training_fit: float
+
+
 _RULE_MEMORY: dict[
     str, dict[tuple[str, int, int, int, int, int], ShowdownObservation]
+] = {}
+_RULE_MODEL_CACHE: dict[
+    str, tuple[tuple[ShowdownObservation, ...], LearnedRuleModel]
 ] = {}
 _RULE_MEMORY_LOCK = Lock()
 
@@ -121,8 +112,8 @@ def decide_move(state: Mapping[str, Any]) -> Move:
     # its rule instead of risking chips based on the standard table assumption.
     if (
         _int(state.get("phase"), 0) == 2
-        and equity.observations < 8
-        and (equity.observations < 6 or equity.confidence < 0.72)
+        and equity.observations < 12
+        and (equity.observations < 9 or equity.confidence < 0.76)
     ):
         return _learning_move(
             state,
@@ -192,27 +183,24 @@ def _equity_estimate(
     rule_name = str(state.get("table_rule", ""))
     _remember_showdowns(state, rule_name)
     observations = _rule_observations(rule_name)
-    weights = _candidate_weights(observations)
-    model = RULE_CANDIDATES[max(range(len(weights)), key=weights.__getitem__)]
-    confidence = max(weights)
+    learned = _learn_rule_model(rule_name, observations)
 
     if community is None:
-        total = 0.0
-        for candidate, weight in zip(RULE_CANDIDATES, weights, strict=True):
-            candidate_total = (
-                sum(
-                    _candidate_equity(candidate, your_number, revealed)
-                    for revealed in range(1, 14)
-                )
-                / 13
+        total = (
+            sum(
+                _feature_equity(learned, your_number, revealed)
+                for revealed in range(1, 14)
             )
-            total += weight * candidate_total
-    else:
-        total = sum(
-            weight * _candidate_equity(candidate, your_number, community)
-            for candidate, weight in zip(RULE_CANDIDATES, weights, strict=True)
+            / 13
         )
-    return EquityEstimate(total, confidence, len(observations), model)
+    else:
+        total = _feature_equity(learned, your_number, community)
+    return EquityEstimate(
+        total,
+        learned.confidence,
+        learned.observations,
+        FEATURE_MODEL_NAME,
+    )
 
 
 def _remember_showdowns(state: Mapping[str, Any], rule_name: str) -> None:
@@ -284,97 +272,236 @@ def _remember_showdowns(state: Mapping[str, Any], rule_name: str) -> None:
     if additions:
         with _RULE_MEMORY_LOCK:
             memory = _RULE_MEMORY.setdefault(rule_name, {})
+            changed = any(memory.get(key) != value for key, value in additions.items())
             memory.update(additions)
             while len(memory) > 500:
                 memory.pop(next(iter(memory)))
+                changed = True
+            if changed:
+                _RULE_MODEL_CACHE.pop(rule_name, None)
 
 
 def _rule_observations(rule_name: str) -> tuple[ShowdownObservation, ...]:
     with _RULE_MEMORY_LOCK:
-        return tuple(_RULE_MEMORY.get(rule_name, {}).values())
-
-
-def _candidate_weights(
-    observations: Sequence[ShowdownObservation],
-) -> tuple[float, ...]:
-    if not observations:
-        uniform = 1 / len(RULE_CANDIDATES)
-        return (uniform,) * len(RULE_CANDIDATES)
-
-    scores: list[float] = []
-    for candidate in RULE_CANDIDATES:
-        errors = sum(
-            _compare_rule(
-                candidate,
-                observation.first_number,
-                observation.second_number,
-                observation.community,
-            )
-            != observation.result
-            for observation in observations
+        observations = tuple(_RULE_MEMORY.get(rule_name, {}).values())
+    return tuple(
+        sorted(
+            observations,
+            key=lambda item: (
+                item.community,
+                item.first_number,
+                item.second_number,
+                item.result,
+            ),
         )
-        scores.append(-3.5 * errors)
-    peak = max(scores)
-    raw = [math.exp(score - peak) for score in scores]
-    total = sum(raw)
-    return tuple(weight / total for weight in raw)
+    )
 
 
-def _candidate_equity(candidate: str, your_number: int, community: int) -> float:
-    points = 0.0
-    for opponent_number in range(1, 14):
-        result = _compare_rule(candidate, your_number, opponent_number, community)
-        points += 1.0 if result > 0 else 0.5 if result == 0 else 0.0
-    return points / 13
+def _learn_rule_model(
+    rule_name: str,
+    observations: Sequence[ShowdownObservation],
+) -> LearnedRuleModel:
+    signature = tuple(observations)
+    with _RULE_MEMORY_LOCK:
+        cached = _RULE_MODEL_CACHE.get(rule_name)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+
+    feature_count = len(_rule_features(1, 1))
+    rows: list[tuple[tuple[float, ...], int]] = []
+    for observation in signature:
+        first = _rule_features(observation.first_number, observation.community)
+        second = _rule_features(observation.second_number, observation.community)
+        difference = tuple(left - right for left, right in zip(first, second))
+        if any(abs(value) > 1e-12 for value in difference):
+            rows.append((difference, observation.result))
+
+    if not rows:
+        model = LearnedRuleModel((0.0,) * feature_count, 0.0, 0, 0.5)
+    else:
+        # Batch logistic ranking is deterministic because the complete gradient is
+        # applied at once. A showdown says whether score(first, community) should
+        # be above, below, or level with score(second, community); no named rule
+        # or fixed catalogue is involved.
+        weights = [0.0] * feature_count
+        for epoch in range(100):
+            learning_rate = 0.45 / (1.0 + 0.035 * epoch)
+            gradient = [0.0] * feature_count
+            for difference, result in rows:
+                margin = sum(
+                    weight * value
+                    for weight, value in zip(weights, difference, strict=True)
+                )
+                probability = _sigmoid(margin)
+                target = 0.5 if result == 0 else 0.99 if result > 0 else 0.01
+                error = target - probability
+                for index, value in enumerate(difference):
+                    gradient[index] += error * value
+
+            scale = learning_rate / len(rows)
+            decay = 1.0 - 0.02 * learning_rate
+            for index in range(feature_count):
+                updated = decay * weights[index] + scale * gradient[index]
+                # Proximal L1 regularisation suppresses accidental correlations
+                # from a tiny sample. Context/local features pay a slightly larger
+                # complexity cost than the broadly reusable mathematical features.
+                l1_cost = 0.06 * (1.0 if index < 35 else 1.5)
+                threshold = l1_cost * learning_rate
+                if updated > threshold:
+                    weights[index] = updated - threshold
+                elif updated < -threshold:
+                    weights[index] = updated + threshold
+                else:
+                    weights[index] = 0.0
+
+        fit = _training_fit(weights, rows)
+        distinct_numbers = {
+            number
+            for observation in signature
+            for number in (observation.first_number, observation.second_number)
+        }
+        distinct_communities = {observation.community for observation in signature}
+        coverage = min(1.0, len(rows) / 12.0)
+        diversity = min(
+            1.0,
+            0.5 * len(distinct_numbers) / 9.0 + 0.5 * len(distinct_communities) / 7.0,
+        )
+        learned_signal = _clamp((fit - 0.5) / 0.42, 0.0, 1.0)
+        confidence = coverage * (0.76 * learned_signal + 0.24 * diversity)
+        model = LearnedRuleModel(
+            tuple(weights),
+            _clamp(confidence, 0.0, 1.0),
+            len(rows),
+            fit,
+        )
+
+    with _RULE_MEMORY_LOCK:
+        _RULE_MODEL_CACHE[rule_name] = (signature, model)
+    return model
 
 
-def _compare_rule(candidate: str, first: int, second: int, community: int) -> int:
-    first_rank = _rule_rank(candidate, first, community)
-    second_rank = _rule_rank(candidate, second, community)
-    return (first_rank > second_rank) - (first_rank < second_rank)
+def _rule_features(number: int, community: int) -> tuple[float, ...]:
+    """Describe a card without assuming any particular secret table rule."""
 
-
-def _rule_rank(candidate: str, number: int, community: int) -> tuple[int, ...]:
-    pair = int(number == community)
+    number_scaled = (number - 7) / 6
+    community_scaled = (community - 7) / 6
     distance = abs(number - community)
-    center_distance = abs(number - 7)
-    if candidate == "standard":
-        return (pair, number)
-    if candidate == "pair_low":
-        return (pair, -number)
-    if candidate == "high_card":
-        return (number,)
-    if candidate == "low_card":
-        return (-number,)
-    if candidate == "pair_bad_high":
-        return (-pair, number)
-    if candidate == "pair_bad_low":
-        return (-pair, -number)
-    if candidate.startswith("closest"):
-        return _distance_rank(candidate, -distance, number)
-    if candidate.startswith("farthest"):
-        return _distance_rank(candidate, distance, number)
-    if candidate.startswith("center"):
-        return _distance_rank(candidate, -center_distance, number)
-    if candidate.startswith("extreme"):
-        return _distance_rank(candidate, center_distance, number)
-    if candidate == "community_switch":
-        return (number if community <= 7 else -number,)
-    if candidate == "community_switch_inverse":
-        return (-number if community <= 7 else number,)
-    if candidate == "clockwise":
-        return ((number - community) % 13,)
-    if candidate == "counterclockwise":
-        return ((community - number) % 13,)
-    raise ValueError(f"unknown rule candidate: {candidate}")
+    distance_scaled = distance / 12
+    signed_distance = (number - community) / 12
+    clockwise = (number - community) % 13
+    odd = 1.0 if number % 2 else -1.0
+    prime = 1.0 if number in PRIME_NUMBERS else -1.0
+    community_half = 1.0 if community <= 7 else -1.0
+    community_parity = 1.0 if community % 2 else -1.0
+    community_prime = 1.0 if community in PRIME_NUMBERS else -1.0
+
+    features = [
+        5.0 * number_scaled,
+        2.0 * number_scaled**2,
+        1.5 * number_scaled**3,
+        3.0 * odd,
+        3.0 * prime,
+        10.0 if number == community else 0.0,
+        5.0 * distance_scaled,
+        2.0 * distance_scaled**2,
+        2.0 * signed_distance,
+        1.2 if number > community else -1.2 if number < community else 0.0,
+        2.0 if number % 2 == community % 2 else -2.0,
+        2.0 if (number in PRIME_NUMBERS) == (community in PRIME_NUMBERS) else -2.0,
+        4.0 * clockwise / 12,
+        4.0 * ((community - number) % 13) / 12,
+        4.0 * abs(number - 7) / 6,
+    ]
+
+    # Interactions let the learned ordering change with the community number.
+    # These gates are generic mathematical properties, not hypotheses about
+    # which hidden rules the coordinator may use.
+    base = (number_scaled, odd, prime, distance_scaled, signed_distance)
+    for gate in (
+        community_scaled,
+        community_half,
+        community_parity,
+        community_prime,
+    ):
+        features.extend(2.20 * value * gate for value in base)
+
+    # Cumulative bases interpolate rankings between sparse early showdowns;
+    # compact local bases retain enough flexibility for non-monotonic rules.
+    features.extend(0.34 * (number >= level) for level in range(2, 14))
+    features.extend(0.34 * (distance >= level) for level in range(1, 13))
+    features.extend(0.24 * (clockwise >= level) for level in range(1, 13))
+    features.extend(0.20 * (number - community >= level) for level in range(1, 13))
+    features.extend(0.20 * (community - number >= level) for level in range(1, 13))
+    features.extend(0.16 * (number == level) for level in range(1, 14))
+    features.extend(0.14 * (distance == level) for level in range(13))
+    for gate in (community_half, community_parity, community_prime):
+        features.extend(0.16 * (number >= level) * gate for level in range(2, 14))
+    return tuple(float(value) for value in features)
 
 
-def _distance_rank(candidate: str, primary: int, number: int) -> tuple[int, ...]:
-    if candidate.endswith("_high"):
-        return (primary, number)
-    if candidate.endswith("_low"):
-        return (primary, -number)
-    return (primary,)
+def _feature_score(model: LearnedRuleModel, number: int, community: int) -> float:
+    return sum(
+        weight * value
+        for weight, value in zip(
+            model.weights,
+            _rule_features(number, community),
+            strict=True,
+        )
+    )
+
+
+def _feature_equity(
+    model: LearnedRuleModel,
+    your_number: int,
+    community: int,
+) -> float:
+    if model.observations == 0:
+        return 0.5
+
+    your_score = _feature_score(model, your_number, community)
+    opponent_scores = [
+        _feature_score(model, opponent, community) for opponent in range(1, 14)
+    ]
+    spread = max(opponent_scores) - min(opponent_scores)
+    tie_tolerance = max(1e-8, spread * 0.008)
+    points = 0.0
+    for opponent_score in opponent_scores:
+        difference = your_score - opponent_score
+        points += (
+            1.0
+            if difference > tie_tolerance
+            else 0.0
+            if difference < -tie_tolerance
+            else 0.5
+        )
+
+    raw_equity = points / 13
+    reliability = 0.25 + 0.75 * model.confidence
+    return _clamp(0.5 + (raw_equity - 0.5) * reliability, 0.0, 1.0)
+
+
+def _training_fit(
+    weights: Sequence[float],
+    rows: Sequence[tuple[tuple[float, ...], int]],
+) -> float:
+    quality = 0.0
+    for difference, result in rows:
+        margin = sum(
+            weight * value for weight, value in zip(weights, difference, strict=True)
+        )
+        probability = _sigmoid(margin)
+        if result > 0:
+            quality += probability
+        elif result < 0:
+            quality += 1.0 - probability
+        else:
+            quality += 1.0 - 2.0 * abs(probability - 0.5)
+    return quality / len(rows)
+
+
+def _sigmoid(value: float) -> float:
+    bounded = _clamp(value, -30.0, 30.0)
+    return 1.0 / (1.0 + math.exp(-bounded))
 
 
 def _learning_move(
@@ -402,11 +529,17 @@ def _learning_move(
     # never be learned. Pay bounded prices through both rounds until enough
     # labelled showdowns have accumulated; checking remains preferred when free.
     if round_name == "pre_reveal":
-        learning_cap = max(4, min(round(pot * 0.85), round(stack * 0.07)))
+        learning_cap = max(
+            5,
+            min(round(pot * 1.00), round(stack * 0.09), 14),
+        )
     else:
-        learning_cap = max(5, min(round(pot * 0.90), round(stack * 0.08), 12))
-    informative_call = to_call <= learning_cap and risk <= 0.10
-    priced_call = risk <= 0.12 and equity >= price - 0.06
+        learning_cap = max(
+            7,
+            min(round(pot * 1.05), round(stack * 0.11), 18),
+        )
+    informative_call = to_call <= learning_cap and risk <= 0.13
+    priced_call = risk <= 0.15 and equity >= price - 0.07
     if "call" in legal and (blind_completion or informative_call or priced_call):
         return {"action": "call"}
     return _first_legal(legal, "fold", "call", "check")
@@ -697,6 +830,7 @@ def _phase_target_locked(state: Mapping[str, Any], live_stack: int) -> bool:
 def _clear_rule_memory_for_tests() -> None:
     with _RULE_MEMORY_LOCK:
         _RULE_MEMORY.clear()
+        _RULE_MODEL_CACHE.clear()
 
 
 def _first_legal(legal: set[Action], *preferences: Action) -> Move:

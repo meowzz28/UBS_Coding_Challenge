@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from copy import deepcopy
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
+import app.challenges.showdown as showdown_module
 from app.challenges.showdown import (
+    FEATURE_MODEL_NAME,
     _clear_rule_memory_for_tests,
-    _compare_rule,
     _equity_estimate,
     decide_move,
     pre_reveal_equity,
@@ -121,10 +123,24 @@ def phase_two_state(rule_name: str = "obsidian") -> dict[str, Any]:
     return state
 
 
-def rule_history(candidate: str) -> list[dict[str, Any]]:
+HiddenRank = Callable[[int, int], tuple[int | bool, ...]]
+
+
+def hidden_result(
+    rank: HiddenRank,
+    first: int,
+    second: int,
+    community: int,
+) -> int:
+    first_rank = rank(first, community)
+    second_rank = rank(second, community)
+    return (first_rank > second_rank) - (first_rank < second_rank)
+
+
+def hidden_history(rank: HiddenRank) -> list[dict[str, Any]]:
     histories: list[dict[str, Any]] = []
     for hand_number, (first, second, community) in enumerate(RULE_PROBES, 1):
-        result = _compare_rule(candidate, first, second, community)
+        result = hidden_result(rank, first, second, community)
         winners = [0] if result > 0 else [1] if result < 0 else [0, 1]
         histories.append(
             {
@@ -312,13 +328,30 @@ def test_phase_two_calls_small_reraise_instead_of_deadlocking_rule_learning() ->
     assert decide_move(state) == {"action": "call"}
 
 
+def test_phase_two_pays_a_moderate_early_information_premium() -> None:
+    state = phase_two_state("unseen-rule")
+    state.update(
+        {
+            "your_stack": 190,
+            "pot": 10,
+            "to_call": 10,
+            "legal_actions": ["fold", "call", "raise"],
+            "current_hand_actions": [
+                {"round": "pre_reveal", "seat": 1, "action": "raise", "amount": 12}
+            ],
+        }
+    )
+
+    assert decide_move(state) == {"action": "call"}
+
+
 def test_phase_two_oversized_minimum_raise_falls_back_to_call() -> None:
     state = phase_two_state("known-standard")
     state.update(
         {
             "hand_number": 21,
             "round": "post_reveal",
-            "your_number": 7,
+            "your_number": 10,
             "community_number": 7,
             "your_stack": 180,
             "pot": 40,
@@ -326,7 +359,7 @@ def test_phase_two_oversized_minimum_raise_falls_back_to_call() -> None:
             "min_raise_to": 150,
             "max_raise_to": 180,
             "legal_actions": ["fold", "call", "raise"],
-            "recent_hands": rule_history("standard"),
+            "recent_hands": hidden_history(lambda number, _community: (number,)),
         }
     )
     state["players"][0]["bet_this_round"] = 0
@@ -337,50 +370,81 @@ def test_phase_two_oversized_minimum_raise_falls_back_to_call() -> None:
 
 def test_phase_two_learns_rule_from_showdowns_and_remembers_codename() -> None:
     state = phase_two_state("persistent-onyx")
-    state["recent_hands"] = rule_history("low_card")
+    state["recent_hands"] = hidden_history(lambda number, _community: (-number,))
     estimate = _equity_estimate(state, 1, 7)
 
-    assert estimate.model == "low_card"
-    assert estimate.confidence > 0.90
-    assert estimate.equity > 0.90
+    assert estimate.model == FEATURE_MODEL_NAME
+    assert estimate.confidence > 0.70
+    assert estimate.equity > 0.80
 
     retry = phase_two_state("persistent-onyx")
     retry["match_id"] = "phase2-attempt2-leg1"
     remembered = _equity_estimate(retry, 13, 7)
-    assert remembered.model == "low_card"
     assert remembered.observations == len(RULE_PROBES)
-    assert remembered.equity < 0.10
+    assert remembered.equity < 0.40
 
     unrelated = _equity_estimate(phase_two_state("different-rule"), 13, 7)
     assert unrelated.observations == 0
-    assert unrelated.confidence < 0.10
+    assert unrelated.confidence == 0.0
+    assert unrelated.equity == 0.5
+
+
+def test_phase_two_uses_features_without_a_named_rule_catalogue() -> None:
+    assert not hasattr(showdown_module, "RULE_CANDIDATES")
 
 
 @pytest.mark.parametrize(
-    "candidate",
+    ("label", "rank"),
     [
-        "standard",
-        "pair_low",
-        "high_card",
-        "low_card",
-        "pair_bad_high",
-        "pair_bad_low",
-        "center_high",
-        "extreme_low",
-        "community_switch",
-        "community_switch_inverse",
-        "clockwise",
-        "counterclockwise",
+        ("standard", lambda number, community: (number == community, number)),
+        ("reverse-pairs", lambda number, community: (number == community, -number)),
+        ("high", lambda number, _community: (number,)),
+        ("low", lambda number, _community: (-number,)),
+        ("odd-first", lambda number, _community: (number % 2, number)),
+        (
+            "prime-first",
+            lambda number, _community: (number in {2, 3, 5, 7, 11, 13}, number),
+        ),
+        (
+            "near-community",
+            lambda number, community: (-abs(number - community), number),
+        ),
+        ("far-community", lambda number, community: (abs(number - community), number)),
+        ("near-seven", lambda number, _community: (-abs(number - 7), number)),
+        (
+            "community-reversal",
+            lambda number, community: (number if community <= 7 else -number,),
+        ),
+        ("cyclic", lambda number, community: ((number - community) % 13,)),
     ],
 )
-def test_phase_two_identifies_representative_hidden_rule_families(
-    candidate: str,
+def test_phase_two_generalizes_to_unseen_card_combinations(
+    label: str,
+    rank: HiddenRank,
 ) -> None:
-    state = phase_two_state(f"rule-{candidate}")
-    state["recent_hands"] = rule_history(candidate)
-    estimate = _equity_estimate(state, 8, 5)
-    assert estimate.model == candidate
-    assert estimate.confidence > 0.90
+    state = phase_two_state(f"rule-{label}")
+    state["recent_hands"] = hidden_history(rank)
+
+    absolute_error = 0.0
+    for community in range(1, 14):
+        for number in range(1, 14):
+            estimate = _equity_estimate(state, number, community)
+            true_equity = (
+                sum(
+                    1.0
+                    if hidden_result(rank, number, opponent, community) > 0
+                    else 0.5
+                    if hidden_result(rank, number, opponent, community) == 0
+                    else 0.0
+                    for opponent in range(1, 14)
+                )
+                / 13
+            )
+            absolute_error += abs(estimate.equity - true_equity)
+
+    assert estimate.model == FEATURE_MODEL_NAME
+    assert estimate.confidence > 0.65
+    assert absolute_error / (13 * 13) < 0.22
 
 
 def test_phase_two_uses_learned_rule_for_value_betting() -> None:
@@ -397,7 +461,7 @@ def test_phase_two_uses_learned_rule_for_value_betting() -> None:
             "max_raise_to": 199,
             "legal_actions": ["check", "bet"],
             "current_hand_actions": [],
-            "recent_hands": rule_history("low_card"),
+            "recent_hands": hidden_history(lambda number, _community: (-number,)),
         }
     )
     result = decide_move(state)

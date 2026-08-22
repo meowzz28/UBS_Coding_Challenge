@@ -233,15 +233,18 @@ avoids high-risk marginal calls, and bluffs only at a frequency supported by
 observed folds.
 
 For Phase 2, the bot treats `table_rule` as an opaque stable identifier. It
-collects revealed two-player showdowns, scores a broad family of possible ranking
-rules, and computes equity as a confidence-weighted model rather than assuming
-standard rules. Early uncertain hands check or call through bounded raise sizes
-to obtain shown-number evidence instead of repeatedly folding before the reveal.
-Learned codenames remain in memory across legs and
-retries, so later attempts start with the rule knowledge acquired previously.
-Speculative calls and minimum raises are stack-capped to prevent one uncertain
-hand from destroying a 40-hand leg. Each Phase 2 leg uses a `+25` endgame lock
-once all remaining forced bets can no longer pull the result below the target.
+collects revealed two-player showdowns and trains a deterministic pairwise feature
+model. The learner extracts magnitude, parity, primality, pair, distance, cyclic,
+threshold, and community-interaction features; sparse regularization selects only
+the features supported by the observed winners. There is no list of assumed table
+rules. Equity comes from comparing the learned score for the private number with
+all 13 possible opponent numbers, with confidence shrinkage while evidence is
+limited. Early uncertain hands check or call through moderately higher but still
+bounded raise sizes to gather roughly 9-12 informative showdowns within the tight
+40-hand window. Models are cached by the opaque codename and learned observations
+remain in memory across retries. Speculative calls and minimum raises stay
+stack-capped, and each leg uses a `+25` endgame lock once all remaining forced bets
+can no longer pull the result below the target.
 
 Every response is selected from `legal_actions`; `amount` is returned only for
 `bet` or `raise` and is clamped to the coordinator-provided inclusive range.
