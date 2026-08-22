@@ -11,7 +11,6 @@ from typing import Any, Literal, TypedDict, cast
 
 from fastapi import APIRouter
 
-
 Action = Literal["check", "call", "bet", "raise", "fold"]
 AGGRESSIVE_ACTIONS = {"bet", "raise"}
 RULE_CANDIDATES = (
@@ -123,9 +122,16 @@ def decide_move(state: Mapping[str, Any]) -> Move:
     if (
         _int(state.get("phase"), 0) == 2
         and equity.observations < 8
-        and (equity.observations < 2 or equity.confidence < 0.55)
+        and (equity.observations < 6 or equity.confidence < 0.72)
     ):
-        return _learning_move(state, legal, to_call, pot, stack)
+        return _learning_move(
+            state,
+            legal,
+            to_call,
+            pot,
+            stack,
+            equity.equity,
+        )
 
     if round_name == "post_reveal" and community is not None:
         return _post_reveal_move(
@@ -377,6 +383,7 @@ def _learning_move(
     to_call: int,
     pot: int,
     stack: int,
+    equity: float,
 ) -> Move:
     if to_call == 0:
         return _first_legal(legal, "check", "call", "fold")
@@ -387,12 +394,20 @@ def _learning_move(
     blind_completion = (
         round_name == "pre_reveal" and not actions and to_call <= small_blind
     )
-    cheap_showdown = (
-        round_name == "post_reveal"
-        and to_call <= max(2, round(pot * 0.35))
-        and to_call <= max(2, round(stack * 0.08))
-    )
-    if "call" in legal and (blind_completion or cheap_showdown):
+    risk = to_call / max(1, stack)
+    price = _pot_odds(to_call, pot)
+
+    # A passive learning policy used to fold every time the opponent raised the
+    # completed blind. That produced no shown numbers, so the opaque rule could
+    # never be learned. Pay bounded prices through both rounds until enough
+    # labelled showdowns have accumulated; checking remains preferred when free.
+    if round_name == "pre_reveal":
+        learning_cap = max(4, min(round(pot * 0.85), round(stack * 0.07)))
+    else:
+        learning_cap = max(5, min(round(pot * 0.90), round(stack * 0.08), 12))
+    informative_call = to_call <= learning_cap and risk <= 0.10
+    priced_call = risk <= 0.12 and equity >= price - 0.06
+    if "call" in legal and (blind_completion or informative_call or priced_call):
         return {"action": "call"}
     return _first_legal(legal, "fold", "call", "check")
 
@@ -433,11 +448,11 @@ def _post_reveal_move(
 
         # Raise premium hands for value without turning a marginal edge into an
         # unnecessary tournament-sized pot.
-        if adjusted_equity >= 0.78 and risk <= 0.30 and _can_aggress(legal):
+        if adjusted_equity >= 0.78 and risk <= 0.20 and _can_aggress(legal):
             return _aggressive_move(state, legal, own_bet, to_call, pot, 0.65)
 
         call_margin = 0.035 if profile.aggression_rate >= 0.45 else 0.065
-        affordable = risk <= 0.52 or adjusted_equity >= 0.84
+        affordable = risk <= 0.22 or (adjusted_equity >= 0.90 and risk <= 0.38)
         if "call" in legal and affordable and adjusted_equity >= price + call_margin:
             return {"action": "call"}
         return _first_legal(legal, "fold", "call", "check")
@@ -504,12 +519,12 @@ def _pre_reveal_move(
             1.0,
         )
 
-        if risk <= 0.24 and adjusted_equity >= 0.76 and _can_aggress(legal):
+        if risk <= 0.16 and adjusted_equity >= 0.76 and _can_aggress(legal):
             return _aggressive_move(state, legal, own_bet, to_call, pot, 0.62)
 
         # Avoid calling off most of the match with a hand that has not yet seen the
         # community number. Only top rule-specific equity can call a wide shove.
-        affordable = risk <= 0.38 or adjusted_equity >= 0.84
+        affordable = risk <= 0.18 or (adjusted_equity >= 0.90 and risk <= 0.30)
         margin = 0.075 if profile.aggression_rate < 0.40 else 0.045
         if "call" in legal and affordable and adjusted_equity >= price + margin:
             return {"action": "call"}
@@ -559,13 +574,16 @@ def _opponent_profile(state: Mapping[str, Any]) -> OpponentProfile:
                     if action_name in AGGRESSIVE_ACTIONS:
                         opponent_aggression += 1
 
-                if seat == your_seat and action_name in AGGRESSIVE_ACTIONS:
-                    if index + 1 < len(round_actions):
-                        answer = round_actions[index + 1]
-                        if _int(answer.get("seat"), -2) != your_seat:
-                            responses += 1
-                            if str(answer.get("action", "")) == "fold":
-                                folds += 1
+                if (
+                    seat == your_seat
+                    and action_name in AGGRESSIVE_ACTIONS
+                    and index + 1 < len(round_actions)
+                ):
+                    answer = round_actions[index + 1]
+                    if _int(answer.get("seat"), -2) != your_seat:
+                        responses += 1
+                        if str(answer.get("action", "")) == "fold":
+                            folds += 1
 
     # Include this hand for aggression estimation but not fold response—the hand
     # is incomplete and a missing next action is not evidence of a fold.
@@ -608,6 +626,16 @@ def _aggressive_move(
     if _int(state.get("phase"), 1) == 2:
         pot_fraction *= 1.20
     desired = own_bet + to_call + max(1, round(pot * pot_fraction))
+    if _int(state.get("phase"), 1) == 2:
+        # Phase 2 is scored on clearing +25, not on maximizing a lucky stack.
+        # Never let a large minimum raise silently turn an ordinary value line
+        # into a quarter-match-or-more wager.
+        live_stack = max(0, _int(state.get("your_stack"), 0))
+        extra_cap = max(4, round(live_stack * 0.24))
+        capped_total = own_bet + extra_cap
+        if minimum > capped_total:
+            return _first_legal(legal - {action}, "call", "check", "fold")
+        desired = min(desired, capped_total)
     amount = max(minimum, min(maximum, desired))
     return {"action": action, "amount": amount}
 

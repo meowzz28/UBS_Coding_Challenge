@@ -267,6 +267,74 @@ def test_phase_two_explores_unknown_rule_without_risking_a_raise() -> None:
     assert decide_move(state) == {"action": "call"}
 
 
+def test_phase_two_calls_small_reraise_instead_of_deadlocking_rule_learning() -> None:
+    state = phase_two_state("leg-two-rule")
+    state.update(
+        {
+            "your_number": 13,
+            "your_stack": 197,
+            "pot": 7,
+            "to_call": 3,
+            "min_raise_to": 8,
+            "max_raise_to": 199,
+            "legal_actions": ["fold", "call", "raise"],
+            "current_hand_actions": [
+                {"round": "pre_reveal", "seat": 0, "action": "call", "amount": 2},
+                {"round": "pre_reveal", "seat": 1, "action": "raise", "amount": 5},
+            ],
+        }
+    )
+    state["players"][0].update({"bet_this_round": 2, "stack": 197})
+    state["players"][1].update({"bet_this_round": 5, "stack": 195})
+
+    assert decide_move(state) == {"action": "call"}
+
+    state.update(
+        {
+            "round": "post_reveal",
+            "community_number": 6,
+            "your_stack": 194,
+            "pot": 15,
+            "to_call": 5,
+            "min_raise_to": 10,
+            "max_raise_to": 194,
+            "current_hand_actions": [
+                *state["current_hand_actions"],
+                {"round": "pre_reveal", "seat": 0, "action": "call", "amount": 5},
+                {"round": "post_reveal", "seat": 0, "action": "check"},
+                {"round": "post_reveal", "seat": 1, "action": "bet", "amount": 5},
+            ],
+        }
+    )
+    state["players"][0].update({"bet_this_round": 0, "stack": 194})
+    state["players"][1].update({"bet_this_round": 5, "stack": 190})
+
+    assert decide_move(state) == {"action": "call"}
+
+
+def test_phase_two_oversized_minimum_raise_falls_back_to_call() -> None:
+    state = phase_two_state("known-standard")
+    state.update(
+        {
+            "hand_number": 21,
+            "round": "post_reveal",
+            "your_number": 7,
+            "community_number": 7,
+            "your_stack": 180,
+            "pot": 40,
+            "to_call": 20,
+            "min_raise_to": 150,
+            "max_raise_to": 180,
+            "legal_actions": ["fold", "call", "raise"],
+            "recent_hands": rule_history("standard"),
+        }
+    )
+    state["players"][0]["bet_this_round"] = 0
+    state["players"][1]["bet_this_round"] = 20
+
+    assert decide_move(state) == {"action": "call"}
+
+
 def test_phase_two_learns_rule_from_showdowns_and_remembers_codename() -> None:
     state = phase_two_state("persistent-onyx")
     state["recent_hands"] = rule_history("low_card")
