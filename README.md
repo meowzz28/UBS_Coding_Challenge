@@ -179,10 +179,10 @@ The MCP server advertises three model-callable tools:
 | `calculate` | Evaluates a complete `+`, `-`, `*`, `/` expression with precedence |
 | `identify_shape` | Classifies a base64 PNG as `rectangle`, `triangle`, or `circle` |
 
-The shape tool supports filled and outlined shapes, colored or dark foregrounds,
-uniform backgrounds, transparency, and PNG data URIs. The server instructions
-tell the evaluator's multi-turn agent to compose tools for combination questions
-and never guess.
+The shape tool supports filled and outlined shapes, arbitrary rotation, clipped
+edges, isolated pixel noise, colored or dark foregrounds, transparency, and PNG
+data URIs. The server instructions tell the evaluator's multi-turn agent to
+compose tools for combination questions and never guess.
 
 Arithmetic expressions are submitted to `calculate` in one call. The evaluator
 supports parentheses and standard multiplication/division precedence, while a

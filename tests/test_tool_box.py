@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import random
 from io import BytesIO
 
 from fastapi.testclient import TestClient
@@ -15,24 +16,48 @@ from app.challenges.tool_box import (
 from app.main import app
 
 
-def png_base64(shape: str, *, outline: bool = False) -> str:
-    image = Image.new("RGB", (120, 100), "white")
-    draw = ImageDraw.Draw(image)
+def png_base64(
+    shape: str,
+    *,
+    outline: bool = False,
+    rotation: float = 0,
+    noisy: bool = False,
+    clipped: bool = False,
+) -> str:
+    image = Image.new("RGB", (160, 160), "white")
+    shape_layer = Image.new("RGBA", image.size, (255, 255, 255, 0))
+    draw = ImageDraw.Draw(shape_layer)
     fill = None if outline else "#2166d1"
     width = 5 if outline else 1
     if shape == "rectangle":
-        draw.rectangle((20, 20, 100, 80), fill=fill, outline="#2166d1", width=width)
+        draw.rectangle((35, 45, 125, 115), fill=fill, outline="#2166d1", width=width)
     elif shape == "circle":
-        draw.ellipse((25, 10, 95, 80), fill=fill, outline="#2166d1", width=width)
+        draw.ellipse((35, 35, 125, 125), fill=fill, outline="#2166d1", width=width)
     elif shape == "triangle":
-        draw.polygon(
-            ((60, 10), (105, 85), (15, 85)),
-            fill=fill,
-            outline="#2166d1",
-            width=width,
-        )
+        points = ((40, 25), (135, 80), (40, 135))
+        if clipped:
+            points = ((55, 20), (178, 80), (55, 158))
+        draw.polygon(points, fill=fill, outline="#2166d1", width=width)
     else:
         raise AssertionError(f"unknown test shape: {shape}")
+
+    if rotation:
+        shape_layer = shape_layer.rotate(
+            rotation,
+            resample=Image.Resampling.BICUBIC,
+            center=(80, 80),
+        )
+    image.paste(shape_layer, mask=shape_layer.getchannel("A"))
+
+    if noisy:
+        noise = random.Random(20260822)
+        pixels = image.load()
+        for _ in range(220):
+            x = noise.randrange(image.width)
+            y = noise.randrange(image.height)
+            if pixels[x, y] == (255, 255, 255):
+                shade = noise.randrange(0, 190)
+                pixels[x, y] = (shade, shade, shade)
 
     output = BytesIO()
     image.save(output, format="PNG")
@@ -81,6 +106,23 @@ def test_filled_and_outlined_shapes_are_identified() -> None:
     for shape in ("rectangle", "triangle", "circle"):
         assert identify_shape(png_base64(shape)) == shape
         assert identify_shape(png_base64(shape, outline=True)) == shape
+
+
+def test_shapes_are_rotation_independent_and_ignore_pixel_noise() -> None:
+    cases = (
+        ("rectangle", 37),
+        ("rectangle", 90),
+        ("triangle", 25),
+        ("triangle", 90),
+        ("circle", 0),
+    )
+    for shape, rotation in cases:
+        assert identify_shape(png_base64(shape, rotation=rotation, noisy=True)) == shape
+
+
+def test_clipped_noisy_triangle_from_failed_evaluation_is_identified() -> None:
+    encoded = png_base64("triangle", clipped=True, noisy=True)
+    assert identify_shape(encoded) == "triangle"
 
 
 def test_data_uri_is_accepted() -> None:

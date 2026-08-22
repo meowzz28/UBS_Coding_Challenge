@@ -7,6 +7,7 @@ import base64
 import binascii
 import math
 import statistics
+from collections import deque
 from fractions import Fraction
 from io import BytesIO
 from typing import Annotated, Literal
@@ -190,10 +191,54 @@ def _foreground_mask(image: Image.Image) -> list[list[bool]]:
         for y in range(height)
     ]
 
-    foreground_count = sum(sum(row) for row in mask)
+    mask, foreground_count = _largest_connected_component(mask)
     if foreground_count < max(12, (width * height) // 1000):
         raise ValueError("PNG does not contain a prominent shape")
     return mask
+
+
+def _largest_connected_component(
+    mask: list[list[bool]],
+) -> tuple[list[list[bool]], int]:
+    """Discard isolated compression noise and retain the prominent shape."""
+
+    height = len(mask)
+    width = len(mask[0])
+    visited = bytearray(width * height)
+    largest: list[int] = []
+
+    for y in range(height):
+        for x in range(width):
+            start = y * width + x
+            if visited[start] or not mask[y][x]:
+                continue
+
+            visited[start] = 1
+            queue = deque([start])
+            component: list[int] = []
+            while queue:
+                index = queue.popleft()
+                component.append(index)
+                current_y, current_x = divmod(index, width)
+                for adjacent_y in range(
+                    max(0, current_y - 1), min(height, current_y + 2)
+                ):
+                    for adjacent_x in range(
+                        max(0, current_x - 1), min(width, current_x + 2)
+                    ):
+                        adjacent = adjacent_y * width + adjacent_x
+                        if not visited[adjacent] and mask[adjacent_y][adjacent_x]:
+                            visited[adjacent] = 1
+                            queue.append(adjacent)
+
+            if len(component) > len(largest):
+                largest = component
+
+    cleaned = [[False] * width for _ in range(height)]
+    for index in largest:
+        y, x = divmod(index, width)
+        cleaned[y][x] = True
+    return cleaned, len(largest)
 
 
 def _classify_mask(
@@ -211,42 +256,130 @@ def _classify_mask(
         raise ValueError("detected shape is too small to classify")
 
     cropped = [row[min_x : max_x + 1] for row in mask[min_y : max_y + 1]]
-    row_spans = _span_profile(cropped)
-    column_spans = _span_profile(list(map(list, zip(*cropped))))
-    row_flatness, row_end_difference = _profile_features(row_spans)
-    column_flatness, column_end_difference = _profile_features(column_spans)
+    silhouette = _filled_silhouette(cropped)
+    silhouette_area = sum(sum(row) for row in silhouette)
+    fill_ratio = silhouette_area / (box_width * box_height)
 
-    # Rectangles keep nearly the same outer span along both axes, whether the
-    # shape is filled or outlined.
-    if row_flatness >= 0.72 and column_flatness >= 0.72:
-        return "rectangle"
+    hull = _convex_hull(_silhouette_edge_points(silhouette))
+    tolerance = max(box_width, box_height) * 0.03
+    corners = _simplify_convex_hull(hull, tolerance)
 
-    # A triangle has an apex: on at least one axis its span changes strongly
-    # from one end of the bounding box to the other. This also handles a rotated
-    # left- or right-facing triangle by considering the column profile.
-    if max(row_end_difference, column_end_difference) >= 0.34:
+    if len(corners) <= 3:
         return "triangle"
 
-    # A circle narrows at both ends and reaches its largest span near the middle.
+    if len(corners) == 4:
+        if _opposite_sides_match(corners):
+            return "rectangle"
+        # A triangle whose point extends beyond the canvas becomes a trapezoid.
+        # Its silhouette still occupies about half of its bounding rectangle.
+        if fill_ratio <= 0.68:
+            return "triangle"
+
+    # Rasterized circles retain many significant hull points. A heavily clipped
+    # triangle can as well, but its convex fill remains much smaller than a disk.
+    if fill_ratio <= 0.64:
+        return "triangle"
     return "circle"
 
 
-def _span_profile(rows: list[list[bool]]) -> list[int]:
-    spans: list[int] = []
-    for row in rows:
+def _filled_silhouette(mask: list[list[bool]]) -> list[list[bool]]:
+    """Fill the outer horizontal span so outlined and solid shapes compare alike."""
+
+    silhouette: list[list[bool]] = []
+    for row in mask:
         positions = [index for index, value in enumerate(row) if value]
-        spans.append(positions[-1] - positions[0] + 1 if positions else 0)
-    return spans
+        filled = [False] * len(row)
+        if positions:
+            filled[positions[0] : positions[-1] + 1] = [True] * (
+                positions[-1] - positions[0] + 1
+            )
+        silhouette.append(filled)
+    return silhouette
 
 
-def _profile_features(spans: list[int]) -> tuple[float, float]:
-    maximum = max(spans)
-    normalized = [span / maximum for span in spans]
-    end_size = max(1, len(normalized) // 6)
-    first = statistics.median(normalized[:end_size])
-    last = statistics.median(normalized[-end_size:])
-    flatness = sum(value >= 0.82 for value in normalized) / len(normalized)
-    return flatness, abs(first - last)
+def _silhouette_edge_points(mask: list[list[bool]]) -> list[tuple[int, int]]:
+    points: list[tuple[int, int]] = []
+    for y, row in enumerate(mask):
+        positions = [x for x, value in enumerate(row) if value]
+        if positions:
+            points.append((positions[0], y))
+            points.append((positions[-1], y))
+    return points
+
+
+def _convex_hull(points: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    unique = sorted(set(points))
+    if len(unique) <= 2:
+        return unique
+
+    def cross(
+        origin: tuple[int, int],
+        first: tuple[int, int],
+        second: tuple[int, int],
+    ) -> int:
+        return (first[0] - origin[0]) * (second[1] - origin[1]) - (
+            first[1] - origin[1]
+        ) * (second[0] - origin[0])
+
+    lower: list[tuple[int, int]] = []
+    for point in unique:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0:
+            lower.pop()
+        lower.append(point)
+
+    upper: list[tuple[int, int]] = []
+    for point in reversed(unique):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0:
+            upper.pop()
+        upper.append(point)
+    return lower[:-1] + upper[:-1]
+
+
+def _simplify_convex_hull(
+    hull: list[tuple[int, int]], tolerance: float
+) -> list[tuple[int, int]]:
+    vertices = list(hull)
+    while len(vertices) > 3:
+        distances = [
+            _point_line_distance(
+                vertices[index],
+                vertices[index - 1],
+                vertices[(index + 1) % len(vertices)],
+            )
+            for index in range(len(vertices))
+        ]
+        smallest = min(distances)
+        if smallest > tolerance:
+            break
+        vertices.pop(distances.index(smallest))
+    return vertices
+
+
+def _point_line_distance(
+    point: tuple[int, int], start: tuple[int, int], end: tuple[int, int]
+) -> float:
+    delta_x = end[0] - start[0]
+    delta_y = end[1] - start[1]
+    numerator = abs(
+        delta_y * point[0]
+        - delta_x * point[1]
+        + end[0] * start[1]
+        - end[1] * start[0]
+    )
+    return numerator / max(1.0, math.hypot(delta_x, delta_y))
+
+
+def _opposite_sides_match(corners: list[tuple[int, int]]) -> bool:
+    lengths = [
+        math.dist(corners[index], corners[(index + 1) % 4]) for index in range(4)
+    ]
+
+    def ratio(first: float, second: float) -> float:
+        return min(first, second) / max(first, second, 1.0)
+
+    return ratio(lengths[0], lengths[2]) >= 0.70 and ratio(
+        lengths[1], lengths[3]
+    ) >= 0.70
 
 
 router = APIRouter(prefix="/tool-box", tags=["tool-box"])
