@@ -26,7 +26,6 @@ from mcp.server.transport_security import TransportSecuritySettings
 from PIL import Image, UnidentifiedImageError
 from pydantic import Field
 
-
 ASSISTANT_NAME = "Nova Box"
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_IMAGE_DIMENSION = 2048
@@ -69,7 +68,7 @@ server = MCPServer(
         "sequential calls or evaluate it left-to-right. Use identify_shape for "
         "base64-encoded PNG images. For an exam or factual recall question, call "
         "search with the complete question and answer only from the "
-        "returned source passages. For every journey hop, call next_journey_node "
+        "returned source passages. For every journey hop, call navigate "
         "with the map_id, current node, actual destination, and the supplied hop "
         "allowance when present; return its node exactly. For a school trip whose "
         "destination is a named place rather than a node, first use search to find "
@@ -77,7 +76,7 @@ server = MCPServer(
         "Combine tools when a request contains more than one kind of task. Return "
         "tool results directly and do not guess."
     ),
-    version="2.1.0",
+    version="2.2.0",
 )
 
 
@@ -430,15 +429,17 @@ def search(
             min_length=3,
             max_length=1000,
             description=(
-                "The complete factual question exactly as asked. Returns source "
-                "passages containing the answer; use their facts in the final answer."
+                "The complete factual question exactly as asked. Returns a JSON "
+                "array of source-passage strings; use their facts in the final answer."
             ),
         ),
     ],
-) -> list[str]:
-    """Search all assigned study materials for passages that answer the query."""
+) -> str:
+    """Return relevant passages as one JSON array, as required by the evaluator."""
 
-    return recall_study_material(query)
+    # A Python list[str] becomes multiple MCP TextContent blocks. The evaluator
+    # instead requires one text block whose contents parse as a JSON string array.
+    return json.dumps(recall_study_material(query), ensure_ascii=False)
 
 
 def recall_study_material(
@@ -554,6 +555,56 @@ def next_journey_node(
     with _route_lock:
         _route_cache[cache_key] = tuple(route)
     return route[1]
+
+
+@server.tool()
+def navigate(
+    map_id: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=300,
+            description="The opaque map_id copied exactly from the journey question.",
+        ),
+    ],
+    current_node: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=200,
+            description="The node where the android is currently standing.",
+        ),
+    ],
+    destination: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=500,
+            description=(
+                "The destination node. A school-trip place name is also accepted "
+                "and will be resolved from the study materials to its STOP number."
+            ),
+        ),
+    ],
+    hops_remaining: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "Edges still allowed, including the hop being requested. Omit "
+                "only when the question gives no hop allowance."
+            ),
+        ),
+    ] = None,
+) -> str:
+    """Return the next adjacent node on the least-cost valid route."""
+
+    return next_journey_node(
+        map_id=map_id,
+        current_node=current_node,
+        destination=destination,
+        hops_remaining=hops_remaining,
+    )
 
 
 def _fetch_text(url: str) -> str:

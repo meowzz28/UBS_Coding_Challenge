@@ -16,7 +16,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title="UBS Coding Challenge Server",
     description="One deployable FastAPI service containing independent challenge routers.",
-    version="6.1.0",
+    version="6.2.0",
     lifespan=lifespan,
 )
 

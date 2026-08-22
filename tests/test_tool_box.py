@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import random
 from io import BytesIO
 
@@ -16,6 +17,7 @@ from app.challenges.tool_box import (
     _least_cost_route,
     calculate,
     identify_shape,
+    navigate,
     next_journey_node,
     recall_study_material,
     search,
@@ -180,11 +182,36 @@ def test_search_contract_and_indirect_facility_staffing_question(
         ),
     )
 
-    passages = search(
-        "Roughly how many personnel live aboard the facility simultaneously?"
+    passages = json.loads(
+        search("Roughly how many personnel live aboard the facility simultaneously?")
     )
 
     assert "forty-one" in passages[0]
+
+
+def test_search_returns_one_json_array_of_strings_for_the_grader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tool_box,
+        "_study_chunks",
+        (
+            StudyChunk(
+                1,
+                "Equipment Maintenance Logs",
+                "The station's primary submersible is named the Halcyon Drift.",
+            ),
+        ),
+    )
+
+    raw_result = search(
+        "What is the name given to the outpost's main exploration craft?"
+    )
+    passages = json.loads(raw_result)
+
+    assert isinstance(passages, list)
+    assert all(isinstance(passage, str) for passage in passages)
+    assert "Halcyon Drift" in passages[0]
 
 
 def test_least_cost_route_includes_entry_tolls_and_standard_hop_limit() -> None:
@@ -225,6 +252,7 @@ def test_next_journey_node_is_adjacent_and_reuses_the_chosen_route(
 
     assert next_journey_node("map-1", "A", "D") == "B"
     assert next_journey_node("map-1", "B", "D") == "D"
+    assert navigate("map-1", "A", "D") == "B"
 
 
 def test_school_trip_place_name_resolves_to_documented_stop(
@@ -281,6 +309,7 @@ def test_mcp_server_lists_and_calls_tools(monkeypatch: pytest.MonkeyPatch) -> No
                 "calculate",
                 "identify_shape",
                 "search",
+                "navigate",
                 "next_journey_node",
             }
             calculate_tool = next(
@@ -311,7 +340,21 @@ def test_mcp_server_lists_and_calls_tools(monkeypatch: pytest.MonkeyPatch) -> No
                 "search",
                 {"query": "Which stop serves the Verity Observatory?"},
             )
-            assert "STOP_05" in recall_result.structured_content["result"][0]
+            assert len(recall_result.content) == 1
+            raw_recall = recall_result.content[0].text
+            passages = json.loads(raw_recall)
+            assert all(isinstance(passage, str) for passage in passages)
+            assert "STOP_05" in passages[0]
+
+            navigate_result = await client.call_tool(
+                "navigate",
+                {
+                    "map_id": "trip-map",
+                    "current_node": "START",
+                    "destination": "STOP_05",
+                },
+            )
+            assert navigate_result.structured_content == {"result": "STOP_05"}
 
             journey_result = await client.call_tool(
                 "next_journey_node",

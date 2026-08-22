@@ -171,15 +171,16 @@ than an ordinary REST endpoint. Register this URL with the evaluator:
 https://YOUR-EXISTING-SERVICE.onrender.com/mcp
 ```
 
-The MCP server advertises five model-callable tools:
+The MCP server advertises six model-callable tools:
 
 | Tool | Purpose |
 | --- | --- |
 | `get_name` | Returns the valid assigned name `Nova Box` |
 | `calculate` | Evaluates a complete `+`, `-`, `*`, `/` expression with precedence |
 | `identify_shape` | Classifies a base64 PNG as `rectangle`, `triangle`, or `circle` |
-| `search` | Retrieves relevant source passages within the exact 900-token ceiling |
-| `next_journey_node` | Returns the next adjacent node on the least-cost valid route |
+| `search` | Returns relevant passages as a JSON array within the 900-token ceiling |
+| `navigate` | Returns the next adjacent node on the least-cost valid route |
+| `next_journey_node` | Compatibility name for the same journey operation |
 
 The shape tool supports filled and outlined shapes, arbitrary rotation, clipped
 edges, isolated pixel noise, colored or dark foregrounds, transparency, and PNG
@@ -207,7 +208,7 @@ the study materials, translating documented `STOP_xx` identifiers to the map's
 The FastAPI lifespan starts the MCP session manager used by legacy MCP clients,
 and the SDK also supports the current sessionless protocol on `/mcp`.
 
-The server advertises only five concise tools, well below the challenge limit of
+The server advertises only six concise tools, well below the challenge limit of
 20. Phase 1 results stay below 1,200 tokens, and Phase 2 recall remains below its
 stricter 900-token ceiling. Remote challenge data is cached after its first use.
 
