@@ -3,7 +3,12 @@ services:
     name: ubs-adaptive-api-gateway
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: >-
+      pip install -r requirements.txt &&
+      python -c "import tiktoken; tiktoken.get_encoding('o200k_base')"
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: TIKTOKEN_CACHE_DIR
+        value: .tiktoken_cache
     healthCheckPath: /health
     autoDeploy: true

@@ -3,14 +3,21 @@ import base64
 import random
 from io import BytesIO
 
+import pytest
+import tiktoken
 from fastapi.testclient import TestClient
 from mcp import Client
 from PIL import Image, ImageDraw
 
+from app.challenges import tool_box
 from app.challenges.tool_box import (
     ASSISTANT_NAME,
+    StudyChunk,
+    _least_cost_route,
     calculate,
     identify_shape,
+    next_journey_node,
+    recall_study_material,
     server,
 )
 from app.main import app
@@ -130,7 +137,114 @@ def test_data_uri_is_accepted() -> None:
     assert identify_shape(encoded) == "circle"
 
 
-def test_mcp_server_lists_and_calls_tools() -> None:
+def test_recall_returns_relevant_passages_within_exact_token_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    filler = "Additional unrelated operating detail. " * 70
+    chunks = (
+        StudyChunk(1, "Calibration", "Calibration\nThe Kesterline hydrophone array was recalibrated on 14 March."),
+        StudyChunk(2, "Fares", "Fares\nThe daily transit fare cap is four pounds ninety."),
+        *(StudyChunk(3, "Background", f"Background {index}\n{filler}") for index in range(8)),
+    )
+    monkeypatch.setattr(tool_box, "_study_chunks", chunks)
+
+    passages = recall_study_material(
+        "When was the sensor grid last brought back into alignment?"
+    )
+
+    assert isinstance(passages, list)
+    assert all(isinstance(passage, str) for passage in passages)
+    assert "14 March" in passages[0]
+    encoding = tiktoken.get_encoding("o200k_base")
+    assert sum(len(encoding.encode(passage)) for passage in passages) <= 900
+
+
+def test_least_cost_route_includes_entry_tolls_and_standard_hop_limit() -> None:
+    adjacency = {
+        "A": {"B": 4.0, "C": 2.0, "D": 20.0},
+        "B": {"D": 3.0},
+        "C": {"D": 2.0},
+        "D": {},
+    }
+    tolls = {"A": 5.0, "B": 1.0, "C": 9.0, "D": 2.0}
+
+    assert _least_cost_route(adjacency, tolls, "A", "D", None) == ["A", "B", "D"]
+    assert _least_cost_route(adjacency, tolls, "A", "D", 1) == ["A", "D"]
+
+
+def test_hop_limit_fails_instead_of_returning_an_invalid_route() -> None:
+    adjacency = {"A": {"B": 1.0}, "B": {"D": 1.0}, "D": {}}
+    tolls = {"A": 0.0, "B": 0.0, "D": 0.0}
+
+    with pytest.raises(ValueError, match="remaining hops"):
+        _least_cost_route(adjacency, tolls, "A", "D", 1)
+
+
+def test_next_journey_node_is_adjacent_and_reuses_the_chosen_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = {
+        "adjacency": {
+            "A": {"B": 4.0, "C": 2.0},
+            "B": {"D": 3.0},
+            "C": {"D": 2.0},
+            "D": {},
+        },
+        "tolls": {"A": 5.0, "B": 1.0, "C": 9.0, "D": 2.0},
+    }
+    monkeypatch.setattr(tool_box, "_get_graph", lambda _: graph)
+    tool_box._route_cache.clear()
+
+    assert next_journey_node("map-1", "A", "D") == "B"
+    assert next_journey_node("map-1", "B", "D") == "D"
+
+
+def test_school_trip_place_name_resolves_to_documented_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = {
+        "adjacency": {"START": {"STOP_05": 2.0}, "STOP_05": {}},
+        "tolls": {"START": 0.0, "STOP_05": 1.0},
+    }
+    monkeypatch.setattr(tool_box, "_get_graph", lambda _: graph)
+    monkeypatch.setattr(
+        tool_box,
+        "_study_chunks",
+        (
+            StudyChunk(
+                2,
+                "Line Timetables",
+                "Line Timetables\nThe Verity Observatory is served by STOP_05 on the Russet Line.",
+            ),
+        ),
+    )
+    tool_box._route_cache.clear()
+
+    assert next_journey_node("trip-map", "START", "Verity Observatory") == "STOP_05"
+
+
+def test_mcp_server_lists_and_calls_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        tool_box,
+        "_study_chunks",
+        (
+            StudyChunk(
+                2,
+                "Line Timetables",
+                "Line Timetables\nThe Verity Observatory is served by STOP_05.",
+            ),
+        ),
+    )
+    monkeypatch.setitem(
+        tool_box._graph_cache,
+        "trip-map",
+        {
+            "adjacency": {"START": {"STOP_05": 1.0}, "STOP_05": {}},
+            "tolls": {"START": 0.0, "STOP_05": 0.0},
+        },
+    )
+    tool_box._route_cache.clear()
+
     async def scenario() -> None:
         async with Client(server, raise_exceptions=True) as client:
             listed = await client.list_tools()
@@ -138,6 +252,8 @@ def test_mcp_server_lists_and_calls_tools() -> None:
                 "get_name",
                 "calculate",
                 "identify_shape",
+                "recall_study_material",
+                "next_journey_node",
             }
             calculate_tool = next(
                 tool for tool in listed.tools if tool.name == "calculate"
@@ -160,6 +276,22 @@ def test_mcp_server_lists_and_calls_tools() -> None:
                 {"image_base64": png_base64("triangle")},
             )
             assert shape_result.structured_content == {"result": "triangle"}
+
+            recall_result = await client.call_tool(
+                "recall_study_material",
+                {"question": "Which stop serves the Verity Observatory?"},
+            )
+            assert "STOP_05" in recall_result.structured_content["result"][0]
+
+            journey_result = await client.call_tool(
+                "next_journey_node",
+                {
+                    "map_id": "trip-map",
+                    "current_node": "START",
+                    "destination": "STOP_05",
+                },
+            )
+            assert journey_result.structured_content == {"result": "STOP_05"}
 
     asyncio.run(scenario())
 

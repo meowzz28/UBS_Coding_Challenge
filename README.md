@@ -11,7 +11,7 @@ app/
 └── challenges/
     ├── adaptive_api.py             # Adaptive API Gateway
     ├── ghost_chains.py             # Ghost Chains Phase 1
-    ├── tool_box.py                 # Tool Box Phase 1 MCP server
+    ├── tool_box.py                 # Tool Box Phase 1-2 MCP server
     └── showdown.py                 # SHOWDOWN Phase 1-2 betting strategy
 tests/
 ├── test_adaptive_api.py
@@ -162,7 +162,7 @@ The service uses one Uvicorn worker so all Ghost Chains requests share the same
 in-memory graph. A process restart restores clean startup state, and the evaluator
 can explicitly establish that state through `/ghost-chains/reset`.
 
-## Tool Box - Phase 1
+## Tool Box - Phases 1 and 2
 
 Tool Box is exposed through the official MCP Streamable HTTP transport rather
 than an ordinary REST endpoint. Register this URL with the evaluator:
@@ -171,13 +171,15 @@ than an ordinary REST endpoint. Register this URL with the evaluator:
 https://YOUR-EXISTING-SERVICE.onrender.com/mcp
 ```
 
-The MCP server advertises three model-callable tools:
+The MCP server advertises five model-callable tools:
 
 | Tool | Purpose |
 | --- | --- |
 | `get_name` | Returns the valid assigned name `Nova Box` |
 | `calculate` | Evaluates a complete `+`, `-`, `*`, `/` expression with precedence |
 | `identify_shape` | Classifies a base64 PNG as `rectangle`, `triangle`, or `circle` |
+| `recall_study_material` | Retrieves relevant source passages within the exact 900-token ceiling |
+| `next_journey_node` | Returns the next adjacent node on the least-cost valid route |
 
 The shape tool supports filled and outlined shapes, arbitrary rotation, clipped
 edges, isolated pixel noise, colored or dark foregrounds, transparency, and PNG
@@ -189,14 +191,24 @@ supports parentheses and standard multiplication/division precedence, while a
 restricted Python AST prevents function calls, names, or unsupported operators.
 Every integer literal must remain within the Phase 1 range of -100 to 100.
 
-The MCP implementation is stateless and returns JSON responses, so individual
-tool calls do not depend on process affinity. The FastAPI lifespan starts the MCP
-session manager used by legacy MCP clients, and the SDK also supports the current
-sessionless protocol on the same `/mcp` endpoint.
+For Phase 2 recall, the five published study documents are fetched concurrently,
+split into focused passages, and cached. Ranking combines rare-term relevance,
+phrase matching, and domain synonym expansion. The response is measured with the
+required `o200k_base` tokenizer and can never exceed 900 content tokens.
 
-The server advertises only three concise tools, well below the challenge limit
-of 20, and every tool returns a tiny result well below the 1,200-token limit.
-All computation is local and comfortably inside the 10-second response limit.
+For journeys, the server retrieves the random directed graph using the opaque
+`map_id` and minimizes edge weights plus the toll charged on every entered node.
+Hop-limited routes use constrained shortest-path search. Chosen routes are cached
+between calls so every returned hop is adjacent, never revisits a node, and stays
+within the allowance. Named school-trip destinations can also be resolved from
+the study materials to their documented `STOP_xx` node.
+
+The FastAPI lifespan starts the MCP session manager used by legacy MCP clients,
+and the SDK also supports the current sessionless protocol on `/mcp`.
+
+The server advertises only five concise tools, well below the challenge limit of
+20. Phase 1 results stay below 1,200 tokens, and Phase 2 recall remains below its
+stricter 900-token ceiling. Remote challenge data is cached after its first use.
 
 ## SHOWDOWN - Phases 1 and 2
 
