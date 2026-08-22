@@ -233,7 +233,7 @@ Phase 1 and Phase 3 results stay far below 1,200 tokens, and Phase 2 recall rema
 below its stricter 900-token ceiling. Remote challenge data is cached after its
 first use.
 
-## SHOWDOWN - Phases 1 and 2
+## SHOWDOWN - Phases 1, 2, and 3
 
 Register the existing Render base URL with the SHOWDOWN evaluator. It calls:
 
@@ -247,25 +247,29 @@ from the supplied rolling history. It value-bets pairs and premium numbers,
 avoids high-risk marginal calls, and bluffs only at a frequency supported by
 observed folds.
 
-For Phase 2, the bot treats `table_rule` as an opaque stable identifier. It
-collects revealed two-player showdowns and trains a deterministic pairwise feature
-model. The learner extracts magnitude, parity, primality, pair, distance, cyclic,
-threshold, and community-interaction features; sparse regularization selects only
-the features supported by the observed winners. There is no list of assumed table
-rules. Equity comes from comparing the learned score for the private number with
-all 13 possible opponent numbers, with confidence shrinkage while evidence is
-limited. Early uncertain hands check or call through moderately higher but still
-bounded raise sizes to gather roughly 9-12 informative showdowns within the tight
-40-hand window. Models are cached by the opaque codename and learned observations
-remain in memory across retries. Speculative calls and minimum raises stay
-stack-capped, and each leg uses a `+25` endgame lock once all remaining forced bets
-can no longer pull the result below the target.
+For Phases 2 and 3, the bot treats `table_rule` as an opaque stable identifier.
+Every revealed showdown filters an exact bank of deterministic rank hypotheses,
+including pair/high, lowball, proximity, cyclic, parity, prime, and sum-target
+rules. A rule locks only when one hypothesis remains 100% consistent. When the
+real rule is outside that bank, a per-community pairwise tournament matrix uses
+direct results plus safe transitive closure. Both rule evidence and locked models
+remain cached by codename across legs and retries.
+
+Phase 3 equity counts only non-folded, non-busted opponents and computes exact
+multiway pot share, including split-pot ties. Persistent per-name profiles track
+VPIP, pre-reveal raises, aggression factor, and folds to raises for Dana, Miles,
+Theo, Rhea, and Bram. The 60-hand policy changes from early extraction against
+aggressive players, to midgame shorthanded value and positional steals, to a
+strict endgame leaderboard policy that protects a qualifying 12-chip lead or
+attacks the leader with top-quartile holdings when trailing. Premium early and
+urgent endgame lines may legally use `max_raise_to`; steals remain near half-pot.
+Phase 2 retains its `+25` forced-bet lock and conservative threshold sizing.
 
 Every response is selected from `legal_actions`; `amount` is returned only for
 `bet` or `raise` and is clamped to the coordinator-provided inclusive range.
 `GET /health` warms the whole service, while `GET /showdown/health` is available
-for challenge-specific checks. Render runs one worker so the Phase 2 rule memory
-is shared by every move handled by the deployed process.
+for challenge-specific checks. Render runs one worker so rule and opponent memory
+are shared by every move handled by the deployed process.
 
 ## Add the next challenge
 

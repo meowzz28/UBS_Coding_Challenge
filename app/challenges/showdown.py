@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any, Literal, TypedDict, cast
@@ -14,7 +14,82 @@ from fastapi import APIRouter
 Action = Literal["check", "call", "bet", "raise", "fold"]
 AGGRESSIVE_ACTIONS = {"bet", "raise"}
 PRIME_NUMBERS = frozenset({2, 3, 5, 7, 11, 13})
-FEATURE_MODEL_NAME = "feature-linear-v1"
+EXACT_MODEL_NAME = "exact-hypothesis-v2"
+# Compatibility export retained for callers that displayed the old model name.
+FEATURE_MODEL_NAME = EXACT_MODEL_NAME
+RankKey = tuple[float, ...]
+Ranker = Callable[[int, int], RankKey]
+
+
+def _target_under_rank(number: int, community: int, target: int) -> RankKey:
+    total = number + community
+    return (1.0, float(total)) if total <= target else (0.0, float(-total))
+
+
+def _target_nearest_rank(number: int, community: int, target: int) -> RankKey:
+    total = number + community
+    return (float(-abs(total - target)), float(total))
+
+
+RULE_HYPOTHESES: dict[str, Ranker] = {
+    "standard": lambda number, community: (float(number == community), float(number)),
+    "high": lambda number, _community: (float(number),),
+    "pair-low": lambda number, community: (
+        float(number == community),
+        float(-number),
+    ),
+    "low": lambda number, _community: (float(-number),),
+    "proximity": lambda number, community: (float(-abs(number - community)),),
+    "proximity-high": lambda number, community: (
+        float(-abs(number - community)),
+        float(number),
+    ),
+    "proximity-low": lambda number, community: (
+        float(-abs(number - community)),
+        float(-number),
+    ),
+    "anti-proximity": lambda number, community: (float(abs(number - community)),),
+    "anti-proximity-high": lambda number, community: (
+        float(abs(number - community)),
+        float(number),
+    ),
+    "anti-proximity-low": lambda number, community: (
+        float(abs(number - community)),
+        float(-number),
+    ),
+    "clockwise": lambda number, community: (float(-((number - community) % 13)),),
+    "counter-clockwise": lambda number, community: (
+        float(-((community - number) % 13)),
+    ),
+    "clockwise-farthest": lambda number, community: (float((number - community) % 13),),
+    "counter-clockwise-farthest": lambda number, community: (
+        float((community - number) % 13),
+    ),
+    "near-seven": lambda number, _community: (
+        float(-abs(number - 7)),
+        float(number),
+    ),
+    "community-reversal": lambda number, community: (
+        float(number if community <= 7 else -number),
+    ),
+    "odd-high": lambda number, _community: (float(number % 2), float(number)),
+    "prime-high": lambda number, _community: (
+        float(number in PRIME_NUMBERS),
+        float(number),
+    ),
+    "target-14-under": lambda number, community: _target_under_rank(
+        number, community, 14
+    ),
+    "target-21-under": lambda number, community: _target_under_rank(
+        number, community, 21
+    ),
+    "target-14-nearest": lambda number, community: _target_nearest_rank(
+        number, community, 14
+    ),
+    "target-21-nearest": lambda number, community: _target_nearest_rank(
+        number, community, 21
+    ),
+}
 
 
 class Move(TypedDict, total=False):
@@ -24,11 +99,18 @@ class Move(TypedDict, total=False):
 
 @dataclass(frozen=True)
 class OpponentProfile:
-    """Smoothed tendencies reconstructed from the rolling public history."""
+    """Persistent per-player tendencies with conservative Bayesian smoothing."""
 
     fold_to_aggression: float
     aggression_rate: float
     observations: int
+    name: str = "unknown"
+    vpip: float = 0.5
+    pfr: float = 0.25
+    aggression_factor: float = 1.0
+    fold_to_raise: float = 0.33
+    busted: bool = False
+    archetype: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -46,24 +128,38 @@ class EquityEstimate:
     observations: int
     model: str
     opponents: int = 1
+    percentile: float = 0.5
+    locked_rule: str | None = None
 
 
 @dataclass(frozen=True)
-class LearnedRuleModel:
-    """A deterministic pairwise preference model for one opaque table rule."""
+class ExactRuleModel:
+    """An exact hypothesis lock or a transitive pairwise fallback model."""
 
-    weights: tuple[float, ...]
+    candidates: tuple[str, ...]
+    locked_rule: str | None
+    relations: tuple[tuple[tuple[int | None, ...], ...], ...]
     confidence: float
     observations: int
-    training_fit: float
+
+
+@dataclass(frozen=True)
+class OpponentHandObservation:
+    vpip: bool
+    pfr: bool
+    aggressive_actions: int
+    calls: int
+    faced_raise: int
+    folded_to_raise: int
 
 
 _RULE_MEMORY: dict[
     str, dict[tuple[str, int, int, int, int, int, int, int], ShowdownObservation]
 ] = {}
 _RULE_MODEL_CACHE: dict[
-    str, tuple[tuple[ShowdownObservation, ...], LearnedRuleModel]
+    str, tuple[tuple[ShowdownObservation, ...], ExactRuleModel]
 ] = {}
+_OPPONENT_MEMORY: dict[str, dict[tuple[str, int, int], OpponentHandObservation]] = {}
 _RULE_MEMORY_LOCK = Lock()
 
 
@@ -109,26 +205,6 @@ def decide_move(state: Mapping[str, Any]) -> Move:
             return _first_legal(legal, "fold", "call", "check")
         return _first_legal(legal, "check", "call", "fold")
 
-    # At the start of an opaque-rule leg, reach inexpensive showdowns to learn
-    # instead of risking chips based on an assumed ordering. A multiway showdown
-    # contributes several comparisons, so Phase 3 needs only a few such hands.
-    if (
-        _int(state.get("phase"), 0) in {2, 3}
-        and equity.observations < (12 if equity.opponents == 1 else 18)
-        and (
-            equity.observations < (9 if equity.opponents == 1 else 10)
-            or equity.confidence < 0.76
-        )
-    ):
-        return _learning_move(
-            state,
-            legal,
-            to_call,
-            pot,
-            stack,
-            equity.equity,
-        )
-
     if _int(state.get("phase"), 0) == 3:
         return _phase_three_move(
             state=state,
@@ -138,8 +214,23 @@ def decide_move(state: Mapping[str, Any]) -> Move:
             stack=stack,
             own_bet=own_bet,
             profile=profile,
-            equity=equity.equity,
-            opponents=equity.opponents,
+            estimate=equity,
+        )
+
+    # Phase 2 buys a bounded number of cheap showdowns until the exact engine
+    # locks a rule or the pairwise fallback has enough coverage.
+    if (
+        _int(state.get("phase"), 0) == 2
+        and equity.locked_rule is None
+        and equity.observations < 12
+    ):
+        return _learning_move(
+            state,
+            legal,
+            to_call,
+            pot,
+            stack,
+            equity.equity,
         )
 
     if round_name == "post_reveal" and community is not None:
@@ -196,7 +287,7 @@ def _equity_estimate(
             if community is not None
             else pre_reveal_equity(your_number)
         )
-        return EquityEstimate(equity, 1.0, 100, "standard", 1)
+        return EquityEstimate(equity, 1.0, 100, "standard", 1, equity, "standard")
 
     rule_name = str(state.get("table_rule", ""))
     _remember_showdowns(state, rule_name)
@@ -205,21 +296,24 @@ def _equity_estimate(
     opponents = _live_opponent_count(state)
 
     if community is None:
-        total = (
-            sum(
-                _feature_multiway_equity(learned, your_number, revealed, opponents)
-                for revealed in range(1, 14)
-            )
-            / 13
-        )
+        estimates = [
+            _exact_multiway_equity(learned, your_number, revealed, opponents)
+            for revealed in range(1, 14)
+        ]
+        total = sum(item[0] for item in estimates) / 13
+        percentile = sum(item[1] for item in estimates) / 13
     else:
-        total = _feature_multiway_equity(learned, your_number, community, opponents)
+        total, percentile = _exact_multiway_equity(
+            learned, your_number, community, opponents
+        )
     return EquityEstimate(
         total,
         learned.confidence,
         learned.observations,
-        FEATURE_MODEL_NAME,
+        EXACT_MODEL_NAME,
         opponents,
+        percentile,
+        learned.locked_rule,
     )
 
 
@@ -332,233 +426,161 @@ def _rule_observations(rule_name: str) -> tuple[ShowdownObservation, ...]:
 def _learn_rule_model(
     rule_name: str,
     observations: Sequence[ShowdownObservation],
-) -> LearnedRuleModel:
+) -> ExactRuleModel:
     signature = tuple(observations)
     with _RULE_MEMORY_LOCK:
         cached = _RULE_MODEL_CACHE.get(rule_name)
         if cached is not None and cached[0] == signature:
             return cached[1]
 
-    feature_count = len(_rule_features(1, 1))
-    rows: list[tuple[tuple[float, ...], int]] = []
-    for observation in signature:
-        first = _rule_features(observation.first_number, observation.community)
-        second = _rule_features(observation.second_number, observation.community)
-        difference = tuple(left - right for left, right in zip(first, second))
-        if any(abs(value) > 1e-12 for value in difference):
-            rows.append((difference, observation.result))
-
-    if not rows:
-        model = LearnedRuleModel((0.0,) * feature_count, 0.0, 0, 0.5)
+    candidates = tuple(
+        name
+        for name, ranker in RULE_HYPOTHESES.items()
+        if all(_rank_result(ranker, item) == item.result for item in signature)
+    )
+    relations = _build_transitive_relations(signature)
+    locked = candidates[0] if len(candidates) == 1 else None
+    if not signature:
+        confidence = 0.0
+    elif locked is not None:
+        confidence = 1.0
+    elif candidates:
+        eliminated = 1.0 - len(candidates) / len(RULE_HYPOTHESES)
+        confidence = _clamp(0.25 + 0.55 * eliminated + len(signature) / 100, 0.0, 0.94)
     else:
-        # Batch logistic ranking is deterministic because the complete gradient is
-        # applied at once. A showdown says whether score(first, community) should
-        # be above, below, or level with score(second, community); no named rule
-        # or fixed catalogue is involved.
-        weights = [0.0] * feature_count
-        for epoch in range(100):
-            learning_rate = 0.45 / (1.0 + 0.035 * epoch)
-            gradient = [0.0] * feature_count
-            for difference, result in rows:
-                margin = sum(
-                    weight * value
-                    for weight, value in zip(weights, difference, strict=True)
-                )
-                probability = _sigmoid(margin)
-                target = 0.5 if result == 0 else 0.99 if result > 0 else 0.01
-                error = target - probability
-                for index, value in enumerate(difference):
-                    gradient[index] += error * value
-
-            scale = learning_rate / len(rows)
-            decay = 1.0 - 0.02 * learning_rate
-            for index in range(feature_count):
-                updated = decay * weights[index] + scale * gradient[index]
-                # Proximal L1 regularisation suppresses accidental correlations
-                # from a tiny sample. Context/local features pay a slightly larger
-                # complexity cost than the broadly reusable mathematical features.
-                l1_cost = 0.06 * (1.0 if index < 35 else 1.5)
-                threshold = l1_cost * learning_rate
-                if updated > threshold:
-                    weights[index] = updated - threshold
-                elif updated < -threshold:
-                    weights[index] = updated + threshold
-                else:
-                    weights[index] = 0.0
-
-        fit = _training_fit(weights, rows)
-        distinct_numbers = {
-            number
-            for observation in signature
-            for number in (observation.first_number, observation.second_number)
-        }
-        distinct_communities = {observation.community for observation in signature}
-        coverage = min(1.0, len(rows) / 12.0)
-        diversity = min(
-            1.0,
-            0.5 * len(distinct_numbers) / 9.0 + 0.5 * len(distinct_communities) / 7.0,
-        )
-        learned_signal = _clamp((fit - 0.5) / 0.42, 0.0, 1.0)
-        confidence = coverage * (0.76 * learned_signal + 0.24 * diversity)
-        model = LearnedRuleModel(
-            tuple(weights),
-            _clamp(confidence, 0.0, 1.0),
-            len(rows),
-            fit,
-        )
+        confidence = _clamp(0.30 + len(signature) / 50, 0.0, 0.88)
+    model = ExactRuleModel(
+        candidates,
+        locked,
+        relations,
+        confidence,
+        len(signature),
+    )
 
     with _RULE_MEMORY_LOCK:
         _RULE_MODEL_CACHE[rule_name] = (signature, model)
     return model
 
 
-def _rule_features(number: int, community: int) -> tuple[float, ...]:
-    """Describe a card without assuming any particular secret table rule."""
-
-    number_scaled = (number - 7) / 6
-    community_scaled = (community - 7) / 6
-    distance = abs(number - community)
-    distance_scaled = distance / 12
-    signed_distance = (number - community) / 12
-    clockwise = (number - community) % 13
-    odd = 1.0 if number % 2 else -1.0
-    prime = 1.0 if number in PRIME_NUMBERS else -1.0
-    community_half = 1.0 if community <= 7 else -1.0
-    community_parity = 1.0 if community % 2 else -1.0
-    community_prime = 1.0 if community in PRIME_NUMBERS else -1.0
-
-    features = [
-        5.0 * number_scaled,
-        2.0 * number_scaled**2,
-        1.5 * number_scaled**3,
-        3.0 * odd,
-        3.0 * prime,
-        10.0 if number == community else 0.0,
-        5.0 * distance_scaled,
-        2.0 * distance_scaled**2,
-        2.0 * signed_distance,
-        1.2 if number > community else -1.2 if number < community else 0.0,
-        2.0 if number % 2 == community % 2 else -2.0,
-        2.0 if (number in PRIME_NUMBERS) == (community in PRIME_NUMBERS) else -2.0,
-        4.0 * clockwise / 12,
-        4.0 * ((community - number) % 13) / 12,
-        4.0 * abs(number - 7) / 6,
-    ]
-
-    # Interactions let the learned ordering change with the community number.
-    # These gates are generic mathematical properties, not hypotheses about
-    # which hidden rules the coordinator may use.
-    base = (number_scaled, odd, prime, distance_scaled, signed_distance)
-    for gate in (
-        community_scaled,
-        community_half,
-        community_parity,
-        community_prime,
-    ):
-        features.extend(2.20 * value * gate for value in base)
-
-    # Cumulative bases interpolate rankings between sparse early showdowns;
-    # compact local bases retain enough flexibility for non-monotonic rules.
-    features.extend(0.34 * (number >= level) for level in range(2, 14))
-    features.extend(0.34 * (distance >= level) for level in range(1, 13))
-    features.extend(0.24 * (clockwise >= level) for level in range(1, 13))
-    features.extend(0.20 * (number - community >= level) for level in range(1, 13))
-    features.extend(0.20 * (community - number >= level) for level in range(1, 13))
-    features.extend(0.16 * (number == level) for level in range(1, 14))
-    features.extend(0.14 * (distance == level) for level in range(13))
-    for gate in (community_half, community_parity, community_prime):
-        features.extend(0.16 * (number >= level) * gate for level in range(2, 14))
-    return tuple(float(value) for value in features)
+def _rank_result(ranker: Ranker, observation: ShowdownObservation) -> int:
+    first = ranker(observation.first_number, observation.community)
+    second = ranker(observation.second_number, observation.community)
+    return (first > second) - (first < second)
 
 
-def _feature_score(model: LearnedRuleModel, number: int, community: int) -> float:
-    return sum(
-        weight * value
-        for weight, value in zip(
-            model.weights,
-            _rule_features(number, community),
-            strict=True,
-        )
+def _build_transitive_relations(
+    observations: Sequence[ShowdownObservation],
+) -> tuple[tuple[tuple[int | None, ...], ...], ...]:
+    """Build direct-majority relations and safe strict transitive closure."""
+
+    counts: dict[tuple[int, int, int], list[int]] = {}
+    for item in observations:
+        key = (item.community - 1, item.first_number - 1, item.second_number - 1)
+        bucket = counts.setdefault(key, [0, 0, 0])
+        bucket[0 if item.result > 0 else 1 if item.result < 0 else 2] += 1
+        reverse = (key[0], key[2], key[1])
+        reverse_bucket = counts.setdefault(reverse, [0, 0, 0])
+        reverse_bucket[1 if item.result > 0 else 0 if item.result < 0 else 2] += 1
+
+    cube: list[list[list[int | None]]] = []
+    for community in range(13):
+        matrix: list[list[int | None]] = [[None] * 13 for _ in range(13)]
+        for card in range(13):
+            matrix[card][card] = 0
+        for (seen_community, first, second), bucket in counts.items():
+            if seen_community != community:
+                continue
+            best = max(bucket)
+            winners = [index for index, value in enumerate(bucket) if value == best]
+            if len(winners) == 1:
+                matrix[first][second] = (1, -1, 0)[winners[0]]
+
+        reach = [
+            [matrix[first][second] == 1 for second in range(13)] for first in range(13)
+        ]
+        for middle in range(13):
+            for first in range(13):
+                if not reach[first][middle]:
+                    continue
+                for second in range(13):
+                    reach[first][second] = reach[first][second] or reach[middle][second]
+        for first in range(13):
+            for second in range(13):
+                if matrix[first][second] is not None:
+                    continue
+                if reach[first][second] and not reach[second][first]:
+                    matrix[first][second] = 1
+                elif reach[second][first] and not reach[first][second]:
+                    matrix[first][second] = -1
+        cube.append(matrix)
+    return tuple(
+        tuple(tuple(row) for row in community_matrix) for community_matrix in cube
     )
 
 
-def _feature_equity(
-    model: LearnedRuleModel,
-    your_number: int,
-    community: int,
-) -> float:
-    return _feature_multiway_equity(model, your_number, community, 1)
-
-
-def _feature_multiway_equity(
-    model: LearnedRuleModel,
-    your_number: int,
-    community: int,
-    opponents: int,
-) -> float:
-    """Expected pot share against independent uniform live opponents."""
-
-    opponents = max(1, opponents)
-    fair_share = 1.0 / (opponents + 1)
-    if model.observations == 0:
-        return fair_share
-
-    your_score = _feature_score(model, your_number, community)
-    opponent_scores = [
-        _feature_score(model, opponent, community) for opponent in range(1, 14)
-    ]
-    spread = max(opponent_scores) - min(opponent_scores)
-    tie_tolerance = max(1e-8, spread * 0.008)
-    wins = 0
-    ties = 0
-    for opponent_score in opponent_scores:
-        difference = your_score - opponent_score
-        if difference > tie_tolerance:
-            wins += 1
-        elif difference >= -tie_tolerance:
-            ties += 1
-
+def _share_from_counts(wins: float, ties: float, opponents: int) -> float:
     win_probability = wins / 13
     tie_probability = ties / 13
-    # We receive 1/(k+1) of the pot when exactly k opponents tie us and every
-    # other opponent ranks below us. Any opponent above us contributes zero.
-    raw_equity = sum(
+    return sum(
         math.comb(opponents, tied)
         * tie_probability**tied
         * win_probability ** (opponents - tied)
         / (tied + 1)
         for tied in range(opponents + 1)
     )
-    reliability = 0.25 + 0.75 * model.confidence
-    return _clamp(
-        fair_share + (raw_equity - fair_share) * reliability,
-        0.0,
-        1.0,
-    )
 
 
-def _training_fit(
-    weights: Sequence[float],
-    rows: Sequence[tuple[tuple[float, ...], int]],
-) -> float:
-    quality = 0.0
-    for difference, result in rows:
-        margin = sum(
-            weight * value for weight, value in zip(weights, difference, strict=True)
+def _ranker_equity(
+    ranker: Ranker,
+    your_number: int,
+    community: int,
+    opponents: int,
+) -> tuple[float, float]:
+    your_rank = ranker(your_number, community)
+    ranks = [ranker(number, community) for number in range(1, 14)]
+    wins = sum(rank < your_rank for rank in ranks)
+    ties = sum(rank == your_rank for rank in ranks)
+    return _share_from_counts(wins, ties, opponents), (wins + 0.5 * ties) / 13
+
+
+def _exact_multiway_equity(
+    model: ExactRuleModel,
+    your_number: int,
+    community: int,
+    opponents: int,
+) -> tuple[float, float]:
+    """Return expected pot share and exact/empirical single-opponent percentile."""
+
+    opponents = max(1, opponents)
+    fair_share = 1.0 / (opponents + 1)
+    if model.observations == 0:
+        return fair_share, 0.5
+    if model.candidates:
+        values = [
+            _ranker_equity(RULE_HYPOTHESES[name], your_number, community, opponents)
+            for name in model.candidates
+        ]
+        return (
+            sum(value[0] for value in values) / len(values),
+            sum(value[1] for value in values) / len(values),
         )
-        probability = _sigmoid(margin)
-        if result > 0:
-            quality += probability
-        elif result < 0:
-            quality += 1.0 - probability
-        else:
-            quality += 1.0 - 2.0 * abs(probability - 0.5)
-    return quality / len(rows)
 
-
-def _sigmoid(value: float) -> float:
-    bounded = _clamp(value, -30.0, 30.0)
-    return 1.0 / (1.0 + math.exp(-bounded))
+    row = model.relations[community - 1][your_number - 1]
+    wins = sum(result == 1 for result in row)
+    losses = sum(result == -1 for result in row)
+    ties = sum(result == 0 for result in row)
+    unknown = 13 - wins - losses - ties
+    known = wins + losses + ties
+    if known <= 1:
+        return fair_share, 0.5
+    known_percentile = (wins + 0.5 * ties) / known
+    estimated_wins = wins + unknown * known_percentile
+    raw = _share_from_counts(estimated_wins, ties, opponents)
+    reliability = 0.35 + 0.65 * model.confidence
+    return (
+        fair_share + (raw - fair_share) * reliability,
+        0.5 + (known_percentile - 0.5) * reliability,
+    )
 
 
 def _learning_move(
@@ -623,78 +645,149 @@ def _phase_three_move(
     stack: int,
     own_bet: int,
     profile: OpponentProfile,
-    equity: float,
-    opponents: int,
+    estimate: EquityEstimate,
 ) -> Move:
-    """Choose a six-seat action using actual expected multiway pot share."""
+    """Three-stage Phase 3 policy optimized for finishing strictly first."""
 
-    fair_share = 1.0 / (opponents + 1)
-    score_bias = _phase_three_score_bias(state)
-    adjusted = _clamp(equity + score_bias, 0.0, 1.0)
-    protecting = score_bias < -0.025
+    equity = estimate.equity
+    percentile = estimate.percentile
+    fair_share = 1.0 / (estimate.opponents + 1)
     round_name = str(state.get("round", "pre_reveal"))
-
-    # A qualifying late lead is worth more than a thin positive-chip EV wager.
-    # Still play genuinely premium holdings because opponents can overtake one
-    # another even after we fold.
-    protect_threshold = max(0.42, fair_share * 2.7)
-    if protecting and adjusted < protect_threshold:
-        if to_call > 0:
-            return _first_legal(legal, "fold", "call", "check")
-        return _first_legal(legal, "check", "call", "fold")
-
-    if round_name == "post_reveal":
-        premium = max(0.34, fair_share * 2.15)
-        near_nuts = max(0.55, fair_share * 3.35)
-        if to_call > 0:
-            price = _pot_odds(to_call, pot)
-            risk = to_call / max(1, stack)
-            urgent = score_bias > 0.025
-            risk_limit = 0.34 if urgent else 0.20
-            if adjusted >= near_nuts and risk <= 0.30 and _can_aggress(legal):
-                return _aggressive_move(state, legal, own_bet, to_call, pot, 0.62)
-            tendency_adjustment = (profile.aggression_rate - 0.30) * 0.10
-            call_equity = adjusted + tendency_adjustment
-            margin = 0.015 if urgent else 0.04
-            if "call" in legal and risk <= risk_limit and call_equity >= price + margin:
-                return {"action": "call"}
-            return _first_legal(legal, "fold", "call", "check")
-
-        if adjusted >= near_nuts and _can_aggress(legal):
-            return _aggressive_move(state, legal, own_bet, 0, pot, 0.72)
-        if adjusted >= premium and _can_aggress(legal):
-            return _aggressive_move(state, legal, own_bet, 0, pot, 0.46)
-        if adjusted <= fair_share * 0.55 and _can_aggress(legal):
-            bluff_rate = _clamp(
-                0.025 + (profile.fold_to_aggression - 0.34) * 0.25,
-                0.01,
-                0.11,
-            )
-            if _mix(state, "multiway-bluff") < bluff_rate:
-                return _aggressive_move(state, legal, own_bet, 0, pot, 0.34)
-        return _first_legal(legal, "check", "call", "fold")
-
+    hand = _int(state.get("hand_number"), 1)
+    own_delta, leader_delta, leader_seat = _leaderboard(state)
+    lead = own_delta - leader_delta
+    target_seat = _last_aggressor_seat(state)
+    late_position = _is_late_position(state, round_name)
     actions = _actions(state.get("current_hand_actions"))
     has_raise = any(
         str(action.get("action", "")) in AGGRESSIVE_ACTIONS for action in actions
     )
-    cheap_entry = to_call <= max(2, _int(state.get("big_blind"), 2)) and not has_raise
-    premium = max(0.30, fair_share * 1.90)
-    playable = max(0.13, fair_share * 0.82)
-    if to_call > 0:
-        price = _pot_odds(to_call, pot)
-        risk = to_call / max(1, stack)
-        if adjusted >= premium and risk <= 0.14 and _can_aggress(legal):
-            return _aggressive_move(state, legal, own_bet, to_call, pot, 0.44)
-        if cheap_entry and adjusted >= playable and "call" in legal:
-            return {"action": "call"}
-        risk_limit = 0.20 if score_bias > 0.025 else 0.12
-        if "call" in legal and risk <= risk_limit and adjusted >= price + 0.035:
+    pair = isinstance(state.get("community_number"), int) and state.get(
+        "your_number"
+    ) == state.get("community_number")
+
+    # Phase C: protect a qualifying 12-chip lead. When behind, top-quartile
+    # holdings attack the chip leader because second place has no value.
+    if hand >= 46 and own_delta >= 10 and lead >= 12:
+        monster = percentile >= 0.94 or (pair and percentile >= 0.80)
+        if not monster:
+            if to_call > 0:
+                return _first_legal(legal, "fold", "call", "check")
+            return _first_legal(legal, "check", "call", "fold")
+        if to_call > 0:
+            return _first_legal(legal, "call", "check", "fold")
+        if _can_aggress(legal):
+            return _aggressive_move(state, legal, own_bet, 0, pot, 0.50)
+        return _first_legal(legal, "check", "call", "fold")
+
+    trailing = hand >= 46 and (lead < 0 or own_delta < 10)
+    if trailing and percentile >= 0.75:
+        urgent = hand >= 55 or max(0, -lead, 10 - own_delta) >= 12
+        if _can_aggress(legal) and (
+            target_seat == leader_seat or to_call == 0 or percentile >= 0.86
+        ):
+            return _aggressive_move(
+                state,
+                legal,
+                own_bet,
+                to_call,
+                pot,
+                1.20,
+                all_in=urgent,
+            )
+        if to_call > 0:
+            return _first_legal(legal, "call", "fold", "check")
+
+    # Candidate-ensemble equity is useful immediately, but buy cheap labelled
+    # showdowns until the hypothesis engine locks or the DAG has enough evidence.
+    if estimate.locked_rule is None and estimate.observations < 8:
+        if to_call == 0:
+            return _first_legal(legal, "check", "call", "fold")
+        learning_cap = max(3, min(round(pot * 0.65), round(stack * 0.07), 10))
+        if "call" in legal and to_call <= learning_cap:
             return {"action": "call"}
         return _first_legal(legal, "fold", "call", "check")
 
-    if adjusted >= premium and _can_aggress(legal):
-        return _aggressive_move(state, legal, own_bet, 0, pot, 0.42)
+    # Phase A: never fold top-30% holdings to the known hyper-aggressive seats
+    # solely because the wager is large; trap or reshove instead.
+    if hand <= 20 and to_call > 0 and profile.archetype == "maniac":
+        if percentile >= 0.86 and _can_aggress(legal):
+            return _aggressive_move(
+                state, legal, own_bet, to_call, pot, 1.0, all_in=True
+            )
+        if percentile >= 0.70:
+            return _first_legal(legal, "call", "fold", "check")
+
+    if round_name == "post_reveal":
+        if to_call > 0:
+            price = _pot_odds(to_call, pot)
+            risk = to_call / max(1, stack)
+            if profile.archetype == "maniac" and percentile >= 0.65:
+                return _first_legal(legal, "call", "fold", "check")
+            if profile.archetype == "lag" and percentile >= 0.70:
+                return _first_legal(legal, "call", "fold", "check")
+            if profile.archetype == "tag" and risk >= 0.15 and percentile < 0.85:
+                return _first_legal(legal, "fold", "call", "check")
+            if percentile >= 0.90 and _can_aggress(legal):
+                return _aggressive_move(
+                    state,
+                    legal,
+                    own_bet,
+                    to_call,
+                    pot,
+                    0.85,
+                    all_in=profile.archetype == "maniac" and hand <= 20,
+                )
+            tendency_bonus = _clamp(
+                (profile.aggression_factor - 1.5) * 0.018,
+                -0.03,
+                0.08,
+            )
+            if "call" in legal and equity + tendency_bonus >= price + 0.025:
+                return {"action": "call"}
+            return _first_legal(legal, "fold", "call", "check")
+
+        value_threshold = (
+            0.62 if hand <= 20 else 0.56 if estimate.opponents <= 2 else 0.68
+        )
+        if percentile >= value_threshold and _can_aggress(legal):
+            fraction = 0.65 if percentile >= 0.82 else 0.52
+            return _aggressive_move(state, legal, own_bet, 0, pot, fraction)
+        if (
+            21 <= hand <= 45
+            and late_position
+            and percentile >= 0.42
+            and _can_aggress(legal)
+        ):
+            return _aggressive_move(state, legal, own_bet, 0, pot, 0.50)
+        return _first_legal(legal, "check", "call", "fold")
+
+    # Phase B: widen in short-handed pots and use the button/cutoff to steal.
+    cheap_entry = to_call <= max(2, _int(state.get("big_blind"), 2)) and not has_raise
+    if to_call > 0:
+        price = _pot_odds(to_call, pot)
+        if percentile >= 0.84 and _can_aggress(legal):
+            return _aggressive_move(state, legal, own_bet, to_call, pot, 0.65)
+        if cheap_entry and percentile >= 0.42 and "call" in legal:
+            return {"action": "call"}
+        if "call" in legal and equity >= price + (0.02 if late_position else 0.05):
+            return {"action": "call"}
+        return _first_legal(legal, "fold", "call", "check")
+
+    steal = (
+        21 <= hand <= 45
+        and late_position
+        and _can_aggress(legal)
+        and (
+            percentile >= 0.40
+            or profile.fold_to_raise >= 0.48
+            or _mix(state, "position-steal") < 0.38
+        )
+    )
+    if steal:
+        return _aggressive_move(state, legal, own_bet, 0, pot, 0.52)
+    if percentile >= max(0.70, 1.0 - fair_share) and _can_aggress(legal):
+        return _aggressive_move(state, legal, own_bet, 0, pot, 0.55)
     return _first_legal(legal, "check", "call", "fold")
 
 
@@ -834,73 +927,206 @@ def _pre_reveal_move(
 
 
 def _opponent_profile(state: Mapping[str, Any]) -> OpponentProfile:
+    _remember_opponents(state)
+    players = _player_maps(state)
     your_seat = _int(state.get("your_seat"), -1)
-    current_actions = _actions(state.get("current_hand_actions"))
-    target_seat: int | None = None
-    for action in reversed(current_actions):
-        seat = _int(action.get("seat"), -2)
-        if seat != your_seat and str(action.get("action", "")) in AGGRESSIVE_ACTIONS:
-            target_seat = seat
-            break
+    target = _last_aggressor_seat(state)
+    if target is not None and target in players:
+        name, busted = players[target]
+        return _profile_for_name(name, busted)
 
-    def tracked(seat: int) -> bool:
-        return seat != your_seat and (target_seat is None or seat == target_seat)
+    profiles = [
+        _profile_for_name(name, busted)
+        for seat, (name, busted) in players.items()
+        if seat != your_seat and not busted
+    ]
+    if not profiles:
+        return OpponentProfile(1 / 3, 0.30, 0)
+    return OpponentProfile(
+        sum(item.fold_to_aggression for item in profiles) / len(profiles),
+        sum(item.aggression_rate for item in profiles) / len(profiles),
+        sum(item.observations for item in profiles),
+        "table",
+        sum(item.vpip for item in profiles) / len(profiles),
+        sum(item.pfr for item in profiles) / len(profiles),
+        sum(item.aggression_factor for item in profiles) / len(profiles),
+        sum(item.fold_to_raise for item in profiles) / len(profiles),
+        False,
+        "mixed",
+    )
 
-    opponent_actions = 0
-    opponent_aggression = 0
-    responses = 0
-    folds = 0
 
+def _player_maps(state: Mapping[str, Any]) -> dict[int, tuple[str, bool]]:
+    result: dict[int, tuple[str, bool]] = {}
+    players = state.get("players")
+    if not isinstance(players, Sequence) or isinstance(players, (str, bytes)):
+        return result
+    for player in players:
+        if not isinstance(player, Mapping):
+            continue
+        seat = _int(player.get("seat"), -1)
+        if seat >= 0:
+            result[seat] = (
+                str(player.get("name", f"seat-{seat}")),
+                player.get("busted") is True,
+            )
+    return result
+
+
+def _remember_opponents(state: Mapping[str, Any]) -> None:
+    players = _player_maps(state)
+    your_seat = _int(state.get("your_seat"), -1)
     histories = state.get("recent_hands")
     if not isinstance(histories, Sequence) or isinstance(histories, (str, bytes)):
-        histories = []
-
+        return
+    match_id = str(state.get("match_id", ""))
+    leg = _int(state.get("leg_number"), 0)
+    additions: list[tuple[str, tuple[str, int, int], OpponentHandObservation]] = []
     for hand in histories:
         if not isinstance(hand, Mapping):
+            continue
+        hand_number = _int(hand.get("hand_number"), 0)
+        if hand_number < 1:
             continue
         grouped: dict[str, list[Mapping[str, Any]]] = {}
         for action in _actions(hand.get("actions")):
             grouped.setdefault(str(action.get("round", "")), []).append(action)
-
-        for round_actions in grouped.values():
-            for index, action in enumerate(round_actions):
-                seat = _int(action.get("seat"), -2)
-                action_name = str(action.get("action", ""))
-                if tracked(seat):
-                    opponent_actions += 1
+        for seat, (name, _busted) in players.items():
+            if seat == your_seat:
+                continue
+            pre = grouped.get("pre_reveal", [])
+            own_pre = [item for item in pre if _int(item.get("seat"), -2) == seat]
+            vpip = any(
+                str(item.get("action", "")) in {"call", "bet", "raise"}
+                for item in own_pre
+            )
+            pfr = any(
+                str(item.get("action", "")) in AGGRESSIVE_ACTIONS for item in own_pre
+            )
+            aggressive = 0
+            calls = 0
+            faced = 0
+            folds = 0
+            for round_actions in grouped.values():
+                prior_raiser: int | None = None
+                for action in round_actions:
+                    action_seat = _int(action.get("seat"), -2)
+                    action_name = str(action.get("action", ""))
+                    if action_seat == seat:
+                        aggressive += int(action_name in AGGRESSIVE_ACTIONS)
+                        calls += int(action_name == "call")
+                        if prior_raiser is not None and prior_raiser != seat:
+                            faced += 1
+                            folds += int(action_name == "fold")
                     if action_name in AGGRESSIVE_ACTIONS:
-                        opponent_aggression += 1
+                        prior_raiser = action_seat
+            additions.append(
+                (
+                    name,
+                    (match_id, leg, hand_number),
+                    OpponentHandObservation(vpip, pfr, aggressive, calls, faced, folds),
+                )
+            )
+    if additions:
+        with _RULE_MEMORY_LOCK:
+            for name, key, observation in additions:
+                memory = _OPPONENT_MEMORY.setdefault(name, {})
+                memory[key] = observation
+                while len(memory) > 500:
+                    memory.pop(next(iter(memory)))
 
-                if (
-                    seat == your_seat
-                    and action_name in AGGRESSIVE_ACTIONS
-                    and index + 1 < len(round_actions)
-                ):
-                    answered_seats: set[int] = set()
-                    for answer in round_actions[index + 1 :]:
-                        answer_seat = _int(answer.get("seat"), -2)
-                        if answer_seat == your_seat:
-                            break
-                        if answer_seat in answered_seats or not tracked(answer_seat):
-                            continue
-                        answered_seats.add(answer_seat)
-                        responses += 1
-                        if str(answer.get("action", "")) == "fold":
-                            folds += 1
 
-    # Include this hand for aggression estimation but not fold response—the hand
-    # is incomplete and a missing next action is not evidence of a fold.
-    for action in current_actions:
-        if tracked(_int(action.get("seat"), -2)):
-            opponent_actions += 1
-            if str(action.get("action", "")) in AGGRESSIVE_ACTIONS:
-                opponent_aggression += 1
+def _profile_for_name(name: str, busted: bool) -> OpponentProfile:
+    with _RULE_MEMORY_LOCK:
+        observations = tuple(_OPPONENT_MEMORY.get(name, {}).values())
+    hands = len(observations)
+    vpip = (sum(item.vpip for item in observations) + 2) / (hands + 4)
+    pfr = (sum(item.pfr for item in observations) + 1) / (hands + 4)
+    aggressive = sum(item.aggressive_actions for item in observations)
+    calls = sum(item.calls for item in observations)
+    faced = sum(item.faced_raise for item in observations)
+    folds = sum(item.folded_to_raise for item in observations)
+    aggression_factor = (aggressive + 1) / (calls + 1)
+    aggression_rate = (aggressive + 3) / (aggressive + calls + 10)
+    fold_to_raise = (folds + 2) / (faced + 6)
+    named_prior = {
+        "Theo": "maniac",
+        "Bram": "maniac",
+        "Miles": "lag",
+        "Dana": "tag",
+        "Rhea": "tag",
+    }.get(name)
+    if hands >= 8 and aggression_factor >= 2.7 and pfr >= 0.34:
+        archetype = "maniac"
+    elif hands >= 8 and vpip >= 0.58 and pfr >= 0.27:
+        archetype = "lag"
+    elif hands >= 8 and vpip <= 0.42 and pfr >= 0.16:
+        archetype = "tag"
+    else:
+        archetype = named_prior or "unknown"
+    return OpponentProfile(
+        fold_to_raise,
+        aggression_rate,
+        hands,
+        name,
+        vpip,
+        pfr,
+        aggression_factor,
+        fold_to_raise,
+        busted,
+        archetype,
+    )
 
-    # Conservative beta priors prevent the first few hands from causing extreme
-    # over-adjustment: fold rate starts at 1/3 and aggression at 0.30.
-    fold_rate = (folds + 2) / (responses + 6)
-    aggression_rate = (opponent_aggression + 3) / (opponent_actions + 10)
-    return OpponentProfile(fold_rate, aggression_rate, opponent_actions)
+
+def _last_aggressor_seat(state: Mapping[str, Any]) -> int | None:
+    your_seat = _int(state.get("your_seat"), -1)
+    round_name = str(state.get("round", ""))
+    for action in reversed(_actions(state.get("current_hand_actions"))):
+        seat = _int(action.get("seat"), -2)
+        if (
+            seat != your_seat
+            and str(action.get("round", "")) == round_name
+            and str(action.get("action", "")) in AGGRESSIVE_ACTIONS
+        ):
+            return seat
+    return None
+
+
+def _leaderboard(state: Mapping[str, Any]) -> tuple[int, int, int | None]:
+    your_seat = _int(state.get("your_seat"), -1)
+    own_delta = 0
+    opponents: list[tuple[int, int]] = []
+    players = state.get("players")
+    if isinstance(players, Sequence) and not isinstance(players, (str, bytes)):
+        for player in players:
+            if not isinstance(player, Mapping):
+                continue
+            seat = _int(player.get("seat"), -2)
+            delta = _int(player.get("chip_delta"), 0)
+            if seat == your_seat:
+                own_delta = delta
+            else:
+                opponents.append((delta, seat))
+    if not opponents:
+        return own_delta, -200, None
+    leader_delta, leader_seat = max(opponents)
+    return own_delta, leader_delta, leader_seat
+
+
+def _is_late_position(state: Mapping[str, Any], round_name: str) -> bool:
+    your_seat = _int(state.get("your_seat"), -1)
+    button = _int(state.get("button_seat"), -2)
+    if your_seat < 0 or button < 0:
+        return False
+    if round_name == "post_reveal":
+        return your_seat == button
+    active = sorted(
+        seat for seat, (_name, busted) in _player_maps(state).items() if not busted
+    )
+    if your_seat == button or not active:
+        return True
+    previous = max((seat for seat in active if seat < button), default=max(active))
+    return your_seat == previous
 
 
 def _aggressive_move(
@@ -910,6 +1136,8 @@ def _aggressive_move(
     to_call: int,
     pot: int,
     pot_fraction: float,
+    *,
+    all_in: bool = False,
 ) -> Move:
     action: Action
     if "raise" in legal:
@@ -929,15 +1157,15 @@ def _aggressive_move(
     phase = _int(state.get("phase"), 1)
     if phase == 2:
         pot_fraction *= 1.20
-    elif phase == 3:
-        pot_fraction *= 0.90
-    desired = own_bet + to_call + max(1, round(pot * pot_fraction))
-    if phase in {2, 3}:
-        # Later phases are scored on thresholds, not on maximizing a lucky stack.
+    desired = (
+        maximum if all_in else own_bet + to_call + max(1, round(pot * pot_fraction))
+    )
+    if phase == 2 and not all_in:
+        # Phase 2 is scored on a fixed threshold, so retain its conservative cap.
         # Never let a large minimum raise silently turn an ordinary value line
         # into a quarter-match-or-more wager.
         live_stack = max(0, _int(state.get("your_stack"), 0))
-        extra_cap = max(4, round(live_stack * (0.24 if phase == 2 else 0.18)))
+        extra_cap = max(4, round(live_stack * 0.24))
         capped_total = own_bet + extra_cap
         if minimum > capped_total:
             return _first_legal(legal - {action}, "call", "check", "fold")
@@ -996,44 +1224,6 @@ def _live_opponent_count(state: Mapping[str, Any]) -> int:
     return max(1, count)
 
 
-def _phase_three_score_bias(state: Mapping[str, Any]) -> float:
-    """Trade chip EV for the +10-and-strictly-first objective late in a leg."""
-
-    players = state.get("players")
-    your_seat = _int(state.get("your_seat"), -1)
-    if not isinstance(players, Sequence) or isinstance(players, (str, bytes)):
-        return 0.0
-
-    own_delta: int | None = None
-    opponent_deltas: list[int] = []
-    for player in players:
-        if not isinstance(player, Mapping):
-            continue
-        delta = _int(player.get("chip_delta"), 0)
-        if _int(player.get("seat"), -2) == your_seat:
-            own_delta = delta
-        else:
-            opponent_deltas.append(delta)
-    if own_delta is None or not opponent_deltas:
-        return 0.0
-
-    hand = _int(state.get("hand_number"), 0)
-    total = _int(state.get("total_hands"), 0)
-    if hand < 1 or total < 1:
-        return 0.0
-    progress = _clamp(hand / total, 0.0, 1.0)
-    if progress < 0.55:
-        return 0.0
-
-    lead = own_delta - max(opponent_deltas)
-    urgency = max(0.0, 10 - own_delta) + max(0.0, 1 - lead)
-    if urgency > 0:
-        return _clamp(0.012 + urgency / 500 * progress, 0.0, 0.06)
-    if progress >= 0.72 and own_delta >= 10 and lead >= 8:
-        return -_clamp(0.02 + lead / 600 * progress, 0.02, 0.055)
-    return 0.0
-
-
 def _phase_target_locked(state: Mapping[str, Any], live_stack: int) -> bool:
     phase = _int(state.get("phase"), 0)
     targets = {1: 10, 2: 25}
@@ -1062,6 +1252,7 @@ def _clear_rule_memory_for_tests() -> None:
     with _RULE_MEMORY_LOCK:
         _RULE_MEMORY.clear()
         _RULE_MODEL_CACHE.clear()
+        _OPPONENT_MEMORY.clear()
 
 
 def _first_legal(legal: set[Action], *preferences: Action) -> Move:

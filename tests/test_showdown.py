@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from copy import deepcopy
+from time import perf_counter
 from typing import Any
 
 import pytest
@@ -450,8 +451,49 @@ def test_phase_two_learns_rule_from_showdowns_and_remembers_codename() -> None:
     assert unrelated.equity == 0.5
 
 
-def test_phase_two_uses_features_without_a_named_rule_catalogue() -> None:
-    assert not hasattr(showdown_module, "RULE_CANDIDATES")
+def test_phase_two_uses_the_required_exact_hypothesis_catalogue() -> None:
+    required = {
+        "standard",
+        "low",
+        "proximity",
+        "anti-proximity",
+        "clockwise",
+        "counter-clockwise",
+        "odd-high",
+        "prime-high",
+        "target-14-under",
+        "target-21-nearest",
+    }
+    assert required <= set(showdown_module.RULE_HYPOTHESES)
+
+
+def test_exact_hypothesis_locks_only_one_fully_consistent_rule() -> None:
+    state = phase_two_state("exact-lowball")
+    state["recent_hands"] = hidden_history(showdown_module.RULE_HYPOTHESES["low"])
+    estimate = _equity_estimate(state, 1, 7)
+
+    assert estimate.locked_rule == "low"
+    assert estimate.confidence == 1.0
+    assert estimate.percentile > 0.90
+
+
+def test_non_catalogue_rule_uses_pairwise_tournament_fallback() -> None:
+    rank = lambda number, community: (number % 3, -abs(number - community))
+    state = phase_two_state("non-catalogue")
+    state["recent_hands"] = hidden_history(rank)
+    estimate = _equity_estimate(state, 7, 7)
+    observations = showdown_module._rule_observations("non-catalogue")
+    model = showdown_module._learn_rule_model("non-catalogue", observations)
+
+    assert estimate.locked_rule is None
+    assert model.candidates == ()
+    first = observations[0]
+    assert (
+        model.relations[first.community - 1][first.first_number - 1][
+            first.second_number - 1
+        ]
+        == first.result
+    )
 
 
 @pytest.mark.parametrize(
@@ -634,6 +676,135 @@ def test_phase_three_protects_a_qualifying_strict_late_lead() -> None:
     assert decide_move(state) == {"action": "fold"}
 
 
+def test_phase_three_persists_individual_opponent_metrics_across_legs() -> None:
+    state = phase_three_state("profile-rule")
+    state["recent_hands"] = [
+        {
+            "hand_number": hand,
+            "community_number": 7,
+            "winners": [3],
+            "shown_numbers": {"3": 13, "0": 2},
+            "actions": [
+                {"round": "pre_reveal", "seat": 3, "action": "raise", "amount": 8},
+                {"round": "pre_reveal", "seat": 0, "action": "call", "amount": 8},
+                {"round": "post_reveal", "seat": 3, "action": "bet", "amount": 16},
+                {"round": "post_reveal", "seat": 0, "action": "fold"},
+            ],
+        }
+        for hand in range(1, 11)
+    ]
+    state.update(
+        {
+            "round": "post_reveal",
+            "current_hand_actions": [
+                {"round": "post_reveal", "seat": 3, "action": "bet", "amount": 20}
+            ],
+        }
+    )
+    first = showdown_module._opponent_profile(state)
+
+    retry = phase_three_state("profile-rule")
+    retry.update(
+        {
+            "match_id": "phase3-attempt2-leg2",
+            "leg_number": 2,
+            "round": "post_reveal",
+            "recent_hands": [],
+            "current_hand_actions": [
+                {"round": "post_reveal", "seat": 3, "action": "bet", "amount": 20}
+            ],
+        }
+    )
+    remembered = showdown_module._opponent_profile(retry)
+
+    assert first.name == remembered.name == "Theo"
+    assert remembered.observations == 10
+    assert remembered.vpip > 0.75
+    assert remembered.pfr > 0.65
+    assert remembered.aggression_factor > 5
+    assert remembered.archetype == "maniac"
+
+
+def test_phase_three_reshoves_premium_hand_against_early_maniac() -> None:
+    state = phase_three_state("early-standard")
+    state.update(
+        {
+            "hand_number": 12,
+            "round": "post_reveal",
+            "your_number": 7,
+            "community_number": 7,
+            "pot": 170,
+            "to_call": 150,
+            "your_stack": 200,
+            "legal_actions": ["fold", "call", "raise"],
+            "min_raise_to": 200,
+            "max_raise_to": 200,
+            "current_hand_actions": [
+                {"round": "post_reveal", "seat": 3, "action": "bet", "amount": 150}
+            ],
+            "recent_hands": hidden_multiway_history(
+                lambda number, community: (number == community, number)
+            ),
+        }
+    )
+
+    assert decide_move(state) == {"action": "raise", "amount": 200}
+
+
+def test_phase_three_midgame_steals_from_late_position() -> None:
+    state = phase_three_state("mid-high")
+    state.update(
+        {
+            "hand_number": 30,
+            "button_seat": 0,
+            "round": "pre_reveal",
+            "your_number": 7,
+            "community_number": None,
+            "pot": 3,
+            "to_call": 0,
+            "legal_actions": ["check", "bet"],
+            "min_raise_to": 2,
+            "max_raise_to": 200,
+            "recent_hands": hidden_multiway_history(
+                lambda number, _community: (number,)
+            ),
+        }
+    )
+    result = decide_move(state)
+
+    assert result["action"] == "bet"
+    assert 2 <= result["amount"] <= 200
+
+
+def test_phase_three_trailing_endgame_shoves_top_quartile_at_leader() -> None:
+    state = phase_three_state("end-high")
+    state.update(
+        {
+            "hand_number": 57,
+            "round": "post_reveal",
+            "your_number": 13,
+            "community_number": 6,
+            "pot": 42,
+            "to_call": 20,
+            "your_stack": 180,
+            "legal_actions": ["fold", "call", "raise"],
+            "min_raise_to": 40,
+            "max_raise_to": 180,
+            "current_hand_actions": [
+                {"round": "post_reveal", "seat": 3, "action": "bet", "amount": 20}
+            ],
+            "recent_hands": hidden_multiway_history(
+                lambda number, _community: (number,)
+            ),
+        }
+    )
+    deltas = [0, 5, -4, 22, -8, -15]
+    for player, delta in zip(state["players"], deltas, strict=True):
+        player["chip_delta"] = delta
+
+    assert decide_move(state) == {"action": "raise", "amount": 180}
+
+
 @pytest.mark.parametrize(
     ("legal", "to_call", "minimum", "maximum"),
     [
@@ -674,6 +845,33 @@ def test_phase_three_always_obeys_the_authoritative_action_contract(
             assert minimum <= result["amount"] <= maximum
         else:
             assert set(result) == {"action"}
+
+
+def test_phase_three_first_uncached_decision_is_under_fifty_milliseconds() -> None:
+    state = phase_three_state("latency-exact")
+    state.update(
+        {
+            "hand_number": 30,
+            "round": "post_reveal",
+            "community_number": 7,
+            "your_number": 13,
+            "pot": 50,
+            "to_call": 8,
+            "legal_actions": ["fold", "call", "raise"],
+            "min_raise_to": 16,
+            "max_raise_to": 200,
+            "recent_hands": hidden_multiway_history(
+                lambda number, community: (number == community, number)
+            ),
+        }
+    )
+
+    started = perf_counter()
+    result = decide_move(state)
+    elapsed = perf_counter() - started
+
+    assert result["action"] in state["legal_actions"]
+    assert elapsed < 0.050
 
 
 def test_http_routes_and_health() -> None:
