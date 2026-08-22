@@ -1,4 +1,4 @@
-"""SHOWDOWN Phase 1 and Phase 2 betting strategy and HTTP routes."""
+"""General SHOWDOWN Phase 1-3 betting strategy and HTTP routes."""
 
 from __future__ import annotations
 
@@ -45,6 +45,7 @@ class EquityEstimate:
     confidence: float
     observations: int
     model: str
+    opponents: int = 1
 
 
 @dataclass(frozen=True)
@@ -58,7 +59,7 @@ class LearnedRuleModel:
 
 
 _RULE_MEMORY: dict[
-    str, dict[tuple[str, int, int, int, int, int], ShowdownObservation]
+    str, dict[tuple[str, int, int, int, int, int, int, int], ShowdownObservation]
 ] = {}
 _RULE_MODEL_CACHE: dict[
     str, tuple[tuple[ShowdownObservation, ...], LearnedRuleModel]
@@ -108,12 +109,16 @@ def decide_move(state: Mapping[str, Any]) -> Move:
             return _first_legal(legal, "fold", "call", "check")
         return _first_legal(legal, "check", "call", "fold")
 
-    # At the start of an opaque Phase 2 leg, reach inexpensive showdowns to learn
-    # its rule instead of risking chips based on the standard table assumption.
+    # At the start of an opaque-rule leg, reach inexpensive showdowns to learn
+    # instead of risking chips based on an assumed ordering. A multiway showdown
+    # contributes several comparisons, so Phase 3 needs only a few such hands.
     if (
-        _int(state.get("phase"), 0) == 2
-        and equity.observations < 12
-        and (equity.observations < 9 or equity.confidence < 0.76)
+        _int(state.get("phase"), 0) in {2, 3}
+        and equity.observations < (12 if equity.opponents == 1 else 18)
+        and (
+            equity.observations < (9 if equity.opponents == 1 else 10)
+            or equity.confidence < 0.76
+        )
     ):
         return _learning_move(
             state,
@@ -122,6 +127,19 @@ def decide_move(state: Mapping[str, Any]) -> Move:
             pot,
             stack,
             equity.equity,
+        )
+
+    if _int(state.get("phase"), 0) == 3:
+        return _phase_three_move(
+            state=state,
+            legal=legal,
+            to_call=to_call,
+            pot=pot,
+            stack=stack,
+            own_bet=own_bet,
+            profile=profile,
+            equity=equity.equity,
+            opponents=equity.opponents,
         )
 
     if round_name == "post_reveal" and community is not None:
@@ -178,28 +196,30 @@ def _equity_estimate(
             if community is not None
             else pre_reveal_equity(your_number)
         )
-        return EquityEstimate(equity, 1.0, 100, "standard")
+        return EquityEstimate(equity, 1.0, 100, "standard", 1)
 
     rule_name = str(state.get("table_rule", ""))
     _remember_showdowns(state, rule_name)
     observations = _rule_observations(rule_name)
     learned = _learn_rule_model(rule_name, observations)
+    opponents = _live_opponent_count(state)
 
     if community is None:
         total = (
             sum(
-                _feature_equity(learned, your_number, revealed)
+                _feature_multiway_equity(learned, your_number, revealed, opponents)
                 for revealed in range(1, 14)
             )
             / 13
         )
     else:
-        total = _feature_equity(learned, your_number, community)
+        total = _feature_multiway_equity(learned, your_number, community, opponents)
     return EquityEstimate(
         total,
         learned.confidence,
         learned.observations,
         FEATURE_MODEL_NAME,
+        opponents,
     )
 
 
@@ -214,7 +234,9 @@ def _remember_showdowns(state: Mapping[str, Any], rule_name: str) -> None:
 
     match_id = str(state.get("match_id", ""))
     leg_number = _int(state.get("leg_number"), 0)
-    additions: dict[tuple[str, int, int, int, int, int], ShowdownObservation] = {}
+    additions: dict[
+        tuple[str, int, int, int, int, int, int, int], ShowdownObservation
+    ] = {}
     for hand in histories:
         if not isinstance(hand, Mapping):
             continue
@@ -240,34 +262,44 @@ def _remember_showdowns(state: Mapping[str, Any], rule_name: str) -> None:
             number = _optional_bounded_int(raw_number, 1, 13)
             if number is not None:
                 seats.append((seat, number))
-        if len(seats) != 2:
+        if len(seats) < 2:
             continue
         seats.sort()
-        winner_seats = {
-            winner
-            for winner in winners
-            if isinstance(winner, int) and not isinstance(winner, bool)
-        }
-        if winner_seats == {seats[0][0], seats[1][0]}:
-            result = 0
-        elif winner_seats == {seats[0][0]}:
-            result = 1
-        elif winner_seats == {seats[1][0]}:
-            result = -1
-        else:
+        winner_seats: set[int] = set()
+        for winner in winners:
+            if isinstance(winner, int) and not isinstance(winner, bool):
+                winner_seats.add(winner)
+        if not winner_seats:
             continue
 
-        key = (
-            match_id,
-            leg_number,
-            hand_number,
-            seats[0][1],
-            seats[1][1],
-            community,
-        )
-        additions[key] = ShowdownObservation(
-            seats[0][1], seats[1][1], community, result
-        )
+        # Winners are known to tie one another and to outrank every shown
+        # non-winner. The relative order of two losing hands is not observable,
+        # so deliberately do not manufacture a label for such a pair.
+        for first_index, (first_seat, first_number) in enumerate(seats):
+            for second_seat, second_number in seats[first_index + 1 :]:
+                first_won = first_seat in winner_seats
+                second_won = second_seat in winner_seats
+                if first_won and second_won:
+                    result = 0
+                elif first_won:
+                    result = 1
+                elif second_won:
+                    result = -1
+                else:
+                    continue
+                key = (
+                    match_id,
+                    leg_number,
+                    hand_number,
+                    first_seat,
+                    second_seat,
+                    first_number,
+                    second_number,
+                    community,
+                )
+                additions[key] = ShowdownObservation(
+                    first_number, second_number, community, result
+                )
 
     if additions:
         with _RULE_MEMORY_LOCK:
@@ -455,8 +487,21 @@ def _feature_equity(
     your_number: int,
     community: int,
 ) -> float:
+    return _feature_multiway_equity(model, your_number, community, 1)
+
+
+def _feature_multiway_equity(
+    model: LearnedRuleModel,
+    your_number: int,
+    community: int,
+    opponents: int,
+) -> float:
+    """Expected pot share against independent uniform live opponents."""
+
+    opponents = max(1, opponents)
+    fair_share = 1.0 / (opponents + 1)
     if model.observations == 0:
-        return 0.5
+        return fair_share
 
     your_score = _feature_score(model, your_number, community)
     opponent_scores = [
@@ -464,20 +509,32 @@ def _feature_equity(
     ]
     spread = max(opponent_scores) - min(opponent_scores)
     tie_tolerance = max(1e-8, spread * 0.008)
-    points = 0.0
+    wins = 0
+    ties = 0
     for opponent_score in opponent_scores:
         difference = your_score - opponent_score
-        points += (
-            1.0
-            if difference > tie_tolerance
-            else 0.0
-            if difference < -tie_tolerance
-            else 0.5
-        )
+        if difference > tie_tolerance:
+            wins += 1
+        elif difference >= -tie_tolerance:
+            ties += 1
 
-    raw_equity = points / 13
+    win_probability = wins / 13
+    tie_probability = ties / 13
+    # We receive 1/(k+1) of the pot when exactly k opponents tie us and every
+    # other opponent ranks below us. Any opponent above us contributes zero.
+    raw_equity = sum(
+        math.comb(opponents, tied)
+        * tie_probability**tied
+        * win_probability ** (opponents - tied)
+        / (tied + 1)
+        for tied in range(opponents + 1)
+    )
     reliability = 0.25 + 0.75 * model.confidence
-    return _clamp(0.5 + (raw_equity - 0.5) * reliability, 0.0, 1.0)
+    return _clamp(
+        fair_share + (raw_equity - fair_share) * reliability,
+        0.0,
+        1.0,
+    )
 
 
 def _training_fit(
@@ -528,7 +585,18 @@ def _learning_move(
     # completed blind. That produced no shown numbers, so the opaque rule could
     # never be learned. Pay bounded prices through both rounds until enough
     # labelled showdowns have accumulated; checking remains preferred when free.
-    if round_name == "pre_reveal":
+    phase = _int(state.get("phase"), 0)
+    if phase == 3 and round_name == "pre_reveal":
+        learning_cap = max(
+            3,
+            min(round(pot * 0.65), round(stack * 0.04), 8),
+        )
+    elif phase == 3:
+        learning_cap = max(
+            4,
+            min(round(pot * 0.60), round(stack * 0.06), 10),
+        )
+    elif round_name == "pre_reveal":
         learning_cap = max(
             5,
             min(round(pot * 1.00), round(stack * 0.09), 14),
@@ -538,11 +606,96 @@ def _learning_move(
             7,
             min(round(pot * 1.05), round(stack * 0.11), 18),
         )
-    informative_call = to_call <= learning_cap and risk <= 0.13
-    priced_call = risk <= 0.15 and equity >= price - 0.07
+    risk_limit = 0.08 if phase == 3 else 0.13
+    informative_call = to_call <= learning_cap and risk <= risk_limit
+    priced_call = risk <= (0.10 if phase == 3 else 0.15) and equity >= price - 0.04
     if "call" in legal and (blind_completion or informative_call or priced_call):
         return {"action": "call"}
     return _first_legal(legal, "fold", "call", "check")
+
+
+def _phase_three_move(
+    *,
+    state: Mapping[str, Any],
+    legal: set[Action],
+    to_call: int,
+    pot: int,
+    stack: int,
+    own_bet: int,
+    profile: OpponentProfile,
+    equity: float,
+    opponents: int,
+) -> Move:
+    """Choose a six-seat action using actual expected multiway pot share."""
+
+    fair_share = 1.0 / (opponents + 1)
+    score_bias = _phase_three_score_bias(state)
+    adjusted = _clamp(equity + score_bias, 0.0, 1.0)
+    protecting = score_bias < -0.025
+    round_name = str(state.get("round", "pre_reveal"))
+
+    # A qualifying late lead is worth more than a thin positive-chip EV wager.
+    # Still play genuinely premium holdings because opponents can overtake one
+    # another even after we fold.
+    protect_threshold = max(0.42, fair_share * 2.7)
+    if protecting and adjusted < protect_threshold:
+        if to_call > 0:
+            return _first_legal(legal, "fold", "call", "check")
+        return _first_legal(legal, "check", "call", "fold")
+
+    if round_name == "post_reveal":
+        premium = max(0.34, fair_share * 2.15)
+        near_nuts = max(0.55, fair_share * 3.35)
+        if to_call > 0:
+            price = _pot_odds(to_call, pot)
+            risk = to_call / max(1, stack)
+            urgent = score_bias > 0.025
+            risk_limit = 0.34 if urgent else 0.20
+            if adjusted >= near_nuts and risk <= 0.30 and _can_aggress(legal):
+                return _aggressive_move(state, legal, own_bet, to_call, pot, 0.62)
+            tendency_adjustment = (profile.aggression_rate - 0.30) * 0.10
+            call_equity = adjusted + tendency_adjustment
+            margin = 0.015 if urgent else 0.04
+            if "call" in legal and risk <= risk_limit and call_equity >= price + margin:
+                return {"action": "call"}
+            return _first_legal(legal, "fold", "call", "check")
+
+        if adjusted >= near_nuts and _can_aggress(legal):
+            return _aggressive_move(state, legal, own_bet, 0, pot, 0.72)
+        if adjusted >= premium and _can_aggress(legal):
+            return _aggressive_move(state, legal, own_bet, 0, pot, 0.46)
+        if adjusted <= fair_share * 0.55 and _can_aggress(legal):
+            bluff_rate = _clamp(
+                0.025 + (profile.fold_to_aggression - 0.34) * 0.25,
+                0.01,
+                0.11,
+            )
+            if _mix(state, "multiway-bluff") < bluff_rate:
+                return _aggressive_move(state, legal, own_bet, 0, pot, 0.34)
+        return _first_legal(legal, "check", "call", "fold")
+
+    actions = _actions(state.get("current_hand_actions"))
+    has_raise = any(
+        str(action.get("action", "")) in AGGRESSIVE_ACTIONS for action in actions
+    )
+    cheap_entry = to_call <= max(2, _int(state.get("big_blind"), 2)) and not has_raise
+    premium = max(0.30, fair_share * 1.90)
+    playable = max(0.13, fair_share * 0.82)
+    if to_call > 0:
+        price = _pot_odds(to_call, pot)
+        risk = to_call / max(1, stack)
+        if adjusted >= premium and risk <= 0.14 and _can_aggress(legal):
+            return _aggressive_move(state, legal, own_bet, to_call, pot, 0.44)
+        if cheap_entry and adjusted >= playable and "call" in legal:
+            return {"action": "call"}
+        risk_limit = 0.20 if score_bias > 0.025 else 0.12
+        if "call" in legal and risk <= risk_limit and adjusted >= price + 0.035:
+            return {"action": "call"}
+        return _first_legal(legal, "fold", "call", "check")
+
+    if adjusted >= premium and _can_aggress(legal):
+        return _aggressive_move(state, legal, own_bet, 0, pot, 0.42)
+    return _first_legal(legal, "check", "call", "fold")
 
 
 def _post_reveal_move(
@@ -682,6 +835,17 @@ def _pre_reveal_move(
 
 def _opponent_profile(state: Mapping[str, Any]) -> OpponentProfile:
     your_seat = _int(state.get("your_seat"), -1)
+    current_actions = _actions(state.get("current_hand_actions"))
+    target_seat: int | None = None
+    for action in reversed(current_actions):
+        seat = _int(action.get("seat"), -2)
+        if seat != your_seat and str(action.get("action", "")) in AGGRESSIVE_ACTIONS:
+            target_seat = seat
+            break
+
+    def tracked(seat: int) -> bool:
+        return seat != your_seat and (target_seat is None or seat == target_seat)
+
     opponent_actions = 0
     opponent_aggression = 0
     responses = 0
@@ -702,7 +866,7 @@ def _opponent_profile(state: Mapping[str, Any]) -> OpponentProfile:
             for index, action in enumerate(round_actions):
                 seat = _int(action.get("seat"), -2)
                 action_name = str(action.get("action", ""))
-                if seat != your_seat:
+                if tracked(seat):
                     opponent_actions += 1
                     if action_name in AGGRESSIVE_ACTIONS:
                         opponent_aggression += 1
@@ -712,16 +876,22 @@ def _opponent_profile(state: Mapping[str, Any]) -> OpponentProfile:
                     and action_name in AGGRESSIVE_ACTIONS
                     and index + 1 < len(round_actions)
                 ):
-                    answer = round_actions[index + 1]
-                    if _int(answer.get("seat"), -2) != your_seat:
+                    answered_seats: set[int] = set()
+                    for answer in round_actions[index + 1 :]:
+                        answer_seat = _int(answer.get("seat"), -2)
+                        if answer_seat == your_seat:
+                            break
+                        if answer_seat in answered_seats or not tracked(answer_seat):
+                            continue
+                        answered_seats.add(answer_seat)
                         responses += 1
                         if str(answer.get("action", "")) == "fold":
                             folds += 1
 
     # Include this hand for aggression estimation but not fold response—the hand
     # is incomplete and a missing next action is not evidence of a fold.
-    for action in _actions(state.get("current_hand_actions")):
-        if _int(action.get("seat"), -2) != your_seat:
+    for action in current_actions:
+        if tracked(_int(action.get("seat"), -2)):
             opponent_actions += 1
             if str(action.get("action", "")) in AGGRESSIVE_ACTIONS:
                 opponent_aggression += 1
@@ -756,15 +926,18 @@ def _aggressive_move(
     if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < minimum:
         return _first_legal(legal - {action}, "call", "check", "fold")
 
-    if _int(state.get("phase"), 1) == 2:
+    phase = _int(state.get("phase"), 1)
+    if phase == 2:
         pot_fraction *= 1.20
+    elif phase == 3:
+        pot_fraction *= 0.90
     desired = own_bet + to_call + max(1, round(pot * pot_fraction))
-    if _int(state.get("phase"), 1) == 2:
-        # Phase 2 is scored on clearing +25, not on maximizing a lucky stack.
+    if phase in {2, 3}:
+        # Later phases are scored on thresholds, not on maximizing a lucky stack.
         # Never let a large minimum raise silently turn an ordinary value line
         # into a quarter-match-or-more wager.
         live_stack = max(0, _int(state.get("your_stack"), 0))
-        extra_cap = max(4, round(live_stack * 0.24))
+        extra_cap = max(4, round(live_stack * (0.24 if phase == 2 else 0.18)))
         capped_total = own_bet + extra_cap
         if minimum > capped_total:
             return _first_legal(legal - {action}, "call", "check", "fold")
@@ -801,6 +974,64 @@ def _own_round_bet(state: Mapping[str, Any]) -> int:
             ):
                 return max(0, _int(player.get("bet_this_round"), 0))
     return 0
+
+
+def _live_opponent_count(state: Mapping[str, Any]) -> int:
+    """Count opponents still eligible to win the current hand."""
+
+    your_seat = _int(state.get("your_seat"), -1)
+    players = state.get("players")
+    count = 0
+    if isinstance(players, Sequence) and not isinstance(players, (str, bytes)):
+        for player in players:
+            if not isinstance(player, Mapping):
+                continue
+            if _int(player.get("seat"), -2) == your_seat:
+                continue
+            if player.get("folded") is True or player.get("busted") is True:
+                continue
+            count += 1
+    # A valid turn always has at least one live opponent. The fallback keeps
+    # partial protocol probes conservative and preserves Phase 2 behaviour.
+    return max(1, count)
+
+
+def _phase_three_score_bias(state: Mapping[str, Any]) -> float:
+    """Trade chip EV for the +10-and-strictly-first objective late in a leg."""
+
+    players = state.get("players")
+    your_seat = _int(state.get("your_seat"), -1)
+    if not isinstance(players, Sequence) or isinstance(players, (str, bytes)):
+        return 0.0
+
+    own_delta: int | None = None
+    opponent_deltas: list[int] = []
+    for player in players:
+        if not isinstance(player, Mapping):
+            continue
+        delta = _int(player.get("chip_delta"), 0)
+        if _int(player.get("seat"), -2) == your_seat:
+            own_delta = delta
+        else:
+            opponent_deltas.append(delta)
+    if own_delta is None or not opponent_deltas:
+        return 0.0
+
+    hand = _int(state.get("hand_number"), 0)
+    total = _int(state.get("total_hands"), 0)
+    if hand < 1 or total < 1:
+        return 0.0
+    progress = _clamp(hand / total, 0.0, 1.0)
+    if progress < 0.55:
+        return 0.0
+
+    lead = own_delta - max(opponent_deltas)
+    urgency = max(0.0, 10 - own_delta) + max(0.0, 1 - lead)
+    if urgency > 0:
+        return _clamp(0.012 + urgency / 500 * progress, 0.0, 0.06)
+    if progress >= 0.72 and own_delta >= 10 and lead >= 8:
+        return -_clamp(0.02 + lead / 600 * progress, 0.02, 0.055)
+    return 0.0
 
 
 def _phase_target_locked(state: Mapping[str, Any], live_stack: int) -> bool:

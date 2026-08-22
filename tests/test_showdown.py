@@ -123,6 +123,41 @@ def phase_two_state(rule_name: str = "obsidian") -> dict[str, Any]:
     return state
 
 
+def phase_three_state(rule_name: str = "obsidian") -> dict[str, Any]:
+    state = phase_two_state(rule_name)
+    state.update(
+        {
+            "match_id": "phase3-attempt1-leg1",
+            "phase": 3,
+            "hand_number": 1,
+            "total_hands": 60,
+            "your_seat": 0,
+            "button_seat": 3,
+            "pot": 3,
+            "to_call": 2,
+        }
+    )
+    names = ["you", "Dana", "Miles", "Theo", "Rhea", "Bram"]
+    state["players"] = [
+        {
+            "seat": seat,
+            "name": name,
+            "folded": False,
+            "chip_delta": 0,
+            "bet_this_round": 0,
+            "stack": 200,
+            "all_in": False,
+            "busted": False,
+        }
+        for seat, name in enumerate(names)
+    ]
+    state["players"][0].update({"stack": 200, "bet_this_round": 0})
+    state["players"][4].update({"stack": 199, "bet_this_round": 1})
+    state["players"][5].update({"stack": 198, "bet_this_round": 2})
+    state["your_stack"] = 200
+    return state
+
+
 HiddenRank = Callable[[int, int], tuple[int | bool, ...]]
 
 
@@ -149,6 +184,32 @@ def hidden_history(rank: HiddenRank) -> list[dict[str, Any]]:
                 "winners": winners,
                 "pot": 4,
                 "shown_numbers": {"0": first, "1": second},
+                "actions": [],
+            }
+        )
+    return histories
+
+
+def hidden_multiway_history(rank: HiddenRank) -> list[dict[str, Any]]:
+    histories: list[dict[str, Any]] = []
+    for hand_number in range(1, 13):
+        community = (hand_number * 5) % 13 + 1
+        numbers = {
+            seat: ((hand_number * (seat + 2) + seat * 3) % 13) + 1 for seat in range(6)
+        }
+        best = max(rank(number, community) for number in numbers.values())
+        winners = [
+            seat for seat, number in numbers.items() if rank(number, community) == best
+        ]
+        histories.append(
+            {
+                "hand_number": hand_number,
+                "community_number": community,
+                "winners": winners,
+                "pot": 18,
+                "shown_numbers": {
+                    str(seat): number for seat, number in numbers.items()
+                },
                 "actions": [],
             }
         )
@@ -487,6 +548,132 @@ def test_phase_two_protects_a_guaranteed_plus_twenty_five_leg() -> None:
     )
     state["players"][0]["stack"] = 240
     assert decide_move(state) == {"action": "fold"}
+
+
+def test_phase_three_unknown_rule_gathers_information_at_bounded_cost() -> None:
+    state = phase_three_state("new-multiway-rule")
+    assert decide_move(state) == {"action": "call"}
+
+    state.update(
+        {
+            "round": "post_reveal",
+            "community_number": 8,
+            "pot": 24,
+            "to_call": 7,
+            "min_raise_to": 14,
+            "current_hand_actions": [
+                {"round": "post_reveal", "seat": 4, "action": "bet", "amount": 7}
+            ],
+        }
+    )
+    assert decide_move(state) == {"action": "call"}
+
+
+def test_phase_three_learns_many_valid_comparisons_per_showdown() -> None:
+    state = phase_three_state("multiway-low")
+    state["recent_hands"] = hidden_multiway_history(
+        lambda number, _community: (-number,)
+    )
+    low = _equity_estimate(state, 1, 7)
+    high = _equity_estimate(state, 13, 7)
+
+    assert low.opponents == 5
+    assert low.observations > len(state["recent_hands"])
+    assert low.confidence > 0.70
+    assert low.equity > high.equity
+
+
+def test_phase_three_equity_accounts_for_every_live_opponent() -> None:
+    state = phase_three_state("multiway-high")
+    state["recent_hands"] = hidden_multiway_history(
+        lambda number, _community: (number,)
+    )
+    six_seat_equity = _equity_estimate(state, 12, 7)
+
+    for player in state["players"][2:]:
+        player["folded"] = True
+    heads_up_equity = _equity_estimate(state, 12, 7)
+
+    assert six_seat_equity.opponents == 5
+    assert heads_up_equity.opponents == 1
+    assert six_seat_equity.equity < heads_up_equity.equity
+
+
+def test_phase_three_filters_folded_and_busted_seats_but_keeps_all_ins() -> None:
+    state = phase_three_state("live-seat-filter")
+    state["players"][1]["folded"] = True
+    state["players"][2]["busted"] = True
+    state["players"][3]["all_in"] = True
+    estimate = _equity_estimate(state, 7, 7)
+
+    assert estimate.opponents == 3
+    assert estimate.equity == pytest.approx(0.25)
+
+
+def test_phase_three_protects_a_qualifying_strict_late_lead() -> None:
+    state = phase_three_state("known-high")
+    state.update(
+        {
+            "hand_number": 58,
+            "round": "post_reveal",
+            "community_number": 7,
+            "your_number": 1,
+            "pot": 35,
+            "to_call": 12,
+            "legal_actions": ["fold", "call", "raise"],
+            "min_raise_to": 24,
+            "recent_hands": hidden_multiway_history(
+                lambda number, _community: (number,)
+            ),
+        }
+    )
+    deltas = [26, 10, 4, -2, -15, -23]
+    for player, delta in zip(state["players"], deltas, strict=True):
+        player["chip_delta"] = delta
+
+    assert decide_move(state) == {"action": "fold"}
+
+
+@pytest.mark.parametrize(
+    ("legal", "to_call", "minimum", "maximum"),
+    [
+        (["check", "bet"], 0, 3, 80),
+        (["fold", "call", "raise"], 9, 18, 100),
+        (["check"], 0, None, None),
+        (["fold", "call"], 25, None, None),
+    ],
+)
+def test_phase_three_always_obeys_the_authoritative_action_contract(
+    legal: list[str],
+    to_call: int,
+    minimum: int | None,
+    maximum: int | None,
+) -> None:
+    state = phase_three_state("contract-rule")
+    state["recent_hands"] = hidden_multiway_history(
+        lambda number, community: (number == community, number)
+    )
+    state.update(
+        {
+            "hand_number": 30,
+            "round": "post_reveal",
+            "community_number": 6,
+            "pot": 45,
+            "to_call": to_call,
+            "legal_actions": legal,
+            "min_raise_to": minimum,
+            "max_raise_to": maximum,
+        }
+    )
+    for number in range(1, 14):
+        state["your_number"] = number
+        result = decide_move(state)
+        assert result["action"] in legal
+        if result["action"] in {"bet", "raise"}:
+            assert minimum is not None and maximum is not None
+            assert minimum <= result["amount"] <= maximum
+        else:
+            assert set(result) == {"action"}
 
 
 def test_http_routes_and_health() -> None:
