@@ -733,13 +733,14 @@ def _phase_three_move(
     profile: OpponentProfile,
     estimate: EquityEstimate,
 ) -> Move:
-    """High-variance EV maximizer strictly tuned for Phase 3 leaderboard dominance."""
+    """SNG/Tournament optimization: Target weak stacks early, isolate and trap the leader late."""
 
     equity = estimate.equity
     percentile = estimate.percentile
     round_name = str(state.get("round", "pre_reveal"))
     hand = max(1, _int(state.get("hand_number"), 1))
     total_hands = max(hand, _int(state.get("total_hands"), 60))
+    remaining = total_hands - hand
     
     own_delta, leader_delta, leader_seat = _leaderboard(state)
     deficit = max(0, leader_delta - own_delta + 1)
@@ -747,62 +748,75 @@ def _phase_three_move(
     target_seat = _last_aggressor_seat(state)
     leader_exposed = _leader_is_exposed(state, leader_seat, target_seat)
     
-    # 1. THE GUARANTEED LOCK
-    if _strict_majority_locked(state, stack, own_delta) or _final_hand_rank_locked(state, stack, own_delta):
-        if to_call > 0:
-            return _first_legal(legal, "fold", "call", "check")
-        return _first_legal(legal, "check", "call", "fold")
-
-    # 2. KAMIKAZE EXPLORATION (Hands 1-15)
-    if estimate.locked_rule is None and hand <= 15:
-        if to_call <= max(10, stack // 10) and "call" in legal:
-            return {"action": "call"}
-        if to_call == 0 and _can_aggress(legal):
-            return _aggressive_move(state, legal, own_bet, 0, pot, 0.5)
-
-    # 3. ENDGAME DESPERATION (Hands 45-60)
-    if hand >= 45 and deficit > 0:
-        if percentile >= 0.75 and _can_aggress(legal):
-            return _aggressive_move(state, legal, own_bet, to_call, pot, 2.0, all_in=True)
-        if percentile >= 0.65 and to_call > 0 and "call" in legal:
-            return {"action": "call"}
-        return _first_legal(legal, "fold", "call", "check")
-
-    # 4. EXPLOITATIVE LEADER TARGETING
-    if leader_exposed and to_call > 0:
-        if percentile >= 0.85 and _can_aggress(legal):
-            return _aggressive_move(state, legal, own_bet, to_call, pot, 1.25)
-        if percentile >= 0.68 and "call" in legal:
-            return {"action": "call"}
-
-    # 5. CORE EXPLOITATIVE VALUE (Hands 16-44)
+    risk = to_call / max(1, stack)
     price = _pot_odds(to_call, pot)
     
+    # 1. THE GUARANTEED LOCK
+    # If we mathematically cannot be caught, fold to victory.
+    if _strict_majority_locked(state, stack, own_delta) or _final_hand_rank_locked(state, stack, own_delta):
+        return _first_legal(legal, "fold", "check")
+
+    # 2. THE BOUNTY HUNTER (Hands 1-30)
+    # We must capture the chips from loose players (Theo/Bram) before Dana/Miles do.
+    # Widen our VPIP significantly if a known maniac is driving the action.
+    if hand <= 30 and profile.archetype in {"maniac", "lag"}:
+        if percentile >= 0.78 and _can_aggress(legal):
+            # Isolate the maniac with a strong 3-bet
+            return _aggressive_move(state, legal, own_bet, to_call, pot, 1.2)
+        if percentile >= 0.60 and to_call <= max(4, stack // 15) and "call" in legal:
+            # Flat call cheaply to see the community number
+            return {"action": "call"}
+
+    # 3. LEADER TRAPPING & ISOLATION
+    # If the runaway leader is exposed, standard EV models fail. We play for stacks.
+    if leader_exposed:
+        if percentile >= 0.88 and _can_aggress(legal):
+            # Overbet shove to force the leader to pay us off with their wide range
+            return _aggressive_move(state, legal, own_bet, to_call, pot, 2.5, all_in=True)
+        if percentile >= 0.70 and to_call > 0 and "call" in legal and risk < 0.25:
+            # Trap with strong hands, let them hang themselves
+            return {"action": "call"}
+        # Do not bleed chips to the leader with marginal hands.
+        return _first_legal(legal, "fold", "check")
+
+    # 4. ENDGAME DESPERATION (Hands 45-60)
+    # If trailing late, we must force variance against ANY opponent.
+    if hand >= 45 and deficit > 0:
+        if percentile >= 0.80 and _can_aggress(legal):
+            return _aggressive_move(state, legal, own_bet, to_call, pot, 1.5, all_in=True)
+        if percentile >= 0.65 and to_call > 0 and equity >= price - 0.05 and "call" in legal:
+            return {"action": "call"}
+        return _first_legal(legal, "fold", "check")
+
+    # 5. CORE EXPLOITATIVE VALUE (Standard Play)
     if round_name == "post_reveal":
         if to_call > 0:
             if percentile >= 0.90 and _can_aggress(legal):
                 return _aggressive_move(state, legal, own_bet, to_call, pot, 1.0)
-            if equity >= price + 0.02 and "call" in legal:
+            if equity >= price + 0.03 and "call" in legal:
                 return {"action": "call"}
-            return _first_legal(legal, "fold", "call", "check")
+            return _first_legal(legal, "fold", "check")
         else:
-            if percentile >= 0.80 and _can_aggress(legal):
+            if percentile >= 0.82 and _can_aggress(legal):
                 return _aggressive_move(state, legal, own_bet, 0, pot, 0.75)
-            if percentile < 0.30 and profile.fold_to_raise > 0.60 and _can_aggress(legal):
+            # Late position steal against tight tables
+            if percentile > 0.40 and profile.fold_to_raise > 0.55 and _can_aggress(legal):
                 return _aggressive_move(state, legal, own_bet, 0, pot, 0.50)
-            return _first_legal(legal, "check", "call", "fold")
+            return _first_legal(legal, "check", "fold")
 
+    # Pre-reveal logic
     if to_call > 0:
         if percentile >= 0.92 and _can_aggress(legal):
             return _aggressive_move(state, legal, own_bet, to_call, pot, 1.0)
-        if equity >= price + 0.05 and "call" in legal:
+        # Tighter calling threshold pre-reveal to avoid bleeding chips
+        if equity >= price + 0.06 and risk < 0.15 and "call" in legal:
             return {"action": "call"}
-        return _first_legal(legal, "fold", "call", "check")
+        return _first_legal(legal, "fold", "check")
     
-    if percentile >= 0.82 and _can_aggress(legal):
+    if percentile >= 0.85 and _can_aggress(legal):
         return _aggressive_move(state, legal, own_bet, 0, pot, 0.60)
         
-    return _first_legal(legal, "check", "call", "fold")
+    return _first_legal(legal, "check", "fold")
 
 
 def _post_reveal_move(
