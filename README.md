@@ -10,7 +10,7 @@ app/
 ├── main.py                         # FastAPI entry point and router registration
 └── challenges/
     ├── adaptive_api.py             # Adaptive API Gateway
-    ├── ghost_chains.py             # Ghost Chains Phase 1
+    ├── ghost_chains.py             # Ghost Chains Phases 1-2
     ├── tool_box.py                 # Tool Box Phase 1-2 MCP server
     └── showdown.py                 # SHOWDOWN Phase 1-2 betting strategy
 tests/
@@ -80,7 +80,7 @@ availability as the fraction whose status is `OK`, and reports the nearest-rank
 95th-percentile latency. If the filtered window is empty, both metrics are zero.
 Phase 1 payloads remain supported and omit `sloOutput` from the response.
 
-## Ghost Chains - Phase 1
+## Ghost Chains - Phases 1 and 2
 
 The Ghost Chains implementation maintains an in-memory directed transaction
 multigraph. It processes each request array sequentially and scores the current
@@ -94,10 +94,18 @@ The Phase 1 score combines structural signals including:
 - return edges that close directed cycles
 - additional return routes into nodes already participating in cycles
 
+Phase 2 adds an attributed identity layer for `ipAddress` and `deviceId`. The
+two dimensions are evaluated independently and combined with graph context. The
+model distinguishes consistent identity along a flow from mid-flow changes,
+identity dropped on later connected legs, branch divergence, and bounded shared-
+infrastructure hints across disconnected components. Identity evidence expires
+with the same exact 24-hour window as its transaction edge.
+
 Scores are deterministic numbers from `0.0` through `1.0`. Transactions older
-than the 24-hour watermark are removed from graph state. An identical duplicate
-`txId` returns its original score without mutating state; reusing a `txId` with a
-different payload returns HTTP `409`. Optional and unknown fields are accepted so
+than the 24-hour watermark are removed from graph and identity state. An
+identical duplicate `txId` returns its original score without mutating state,
+including after graph expiry; reusing a `txId` with a different payload returns
+HTTP `409` before any batch mutation. Optional and unknown fields are accepted so
 later phases can extend the transaction model.
 
 ### Smoke test
