@@ -7,11 +7,19 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.challenges.showdown import (
+    _clear_rule_memory_for_tests,
+    _compare_rule,
+    _equity_estimate,
     decide_move,
     pre_reveal_equity,
     showdown_equity,
 )
 from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def clear_rule_memory() -> None:
+    _clear_rule_memory_for_tests()
 
 
 def sample_state() -> dict[str, Any]:
@@ -58,6 +66,77 @@ def sample_state() -> dict[str, Any]:
         ],
         "recent_hands": [],
     }
+
+
+RULE_PROBES = (
+    (11, 2, 1),
+    (12, 5, 4),
+    (4, 3, 12),
+    (2, 11, 12),
+    (9, 2, 10),
+    (7, 1, 1),
+    (2, 4, 4),
+    (9, 10, 1),
+    (9, 4, 12),
+    (11, 12, 9),
+    (7, 4, 8),
+    (10, 5, 13),
+    (1, 13, 13),
+    (3, 12, 7),
+    (6, 5, 3),
+    (4, 13, 6),
+    (2, 6, 6),
+    (10, 5, 13),
+    (1, 12, 8),
+    (9, 2, 7),
+)
+
+
+def phase_two_state(rule_name: str = "obsidian") -> dict[str, Any]:
+    state = sample_state()
+    state.update(
+        {
+            "match_id": "phase2-attempt1-leg1",
+            "phase": 2,
+            "table_rule": rule_name,
+            "leg_number": 1,
+            "total_legs": 4,
+            "hand_number": 1,
+            "total_hands": 40,
+            "round": "pre_reveal",
+            "community_number": None,
+            "your_number": 7,
+            "pot": 3,
+            "to_call": 1,
+            "min_raise_to": 4,
+            "max_raise_to": 200,
+            "legal_actions": ["fold", "call", "raise"],
+            "current_hand_actions": [],
+            "recent_hands": [],
+            "your_stack": 199,
+        }
+    )
+    state["players"][0].update({"bet_this_round": 1, "stack": 199})
+    state["players"][1].update({"bet_this_round": 2, "stack": 198})
+    return state
+
+
+def rule_history(candidate: str) -> list[dict[str, Any]]:
+    histories: list[dict[str, Any]] = []
+    for hand_number, (first, second, community) in enumerate(RULE_PROBES, 1):
+        result = _compare_rule(candidate, first, second, community)
+        winners = [0] if result > 0 else [1] if result < 0 else [0, 1]
+        histories.append(
+            {
+                "hand_number": hand_number,
+                "community_number": community,
+                "winners": winners,
+                "pot": 4,
+                "shown_numbers": {"0": first, "1": second},
+                "actions": [],
+            }
+        )
+    return histories
 
 
 def test_exact_equities_cover_pairs_high_cards_and_pre_reveal_range() -> None:
@@ -164,6 +243,117 @@ def test_phase_one_protects_a_guaranteed_qualifying_finish() -> None:
         }
     )
     state["players"][0]["stack"] = 230
+    assert decide_move(state) == {"action": "fold"}
+
+
+def test_phase_two_explores_unknown_rule_without_risking_a_raise() -> None:
+    state = phase_two_state()
+    assert decide_move(state) == {"action": "call"}
+
+    state.update(
+        {
+            "round": "post_reveal",
+            "community_number": 6,
+            "pot": 6,
+            "to_call": 2,
+            "min_raise_to": 4,
+            "max_raise_to": 198,
+            "legal_actions": ["fold", "call", "raise"],
+            "current_hand_actions": [
+                {"round": "post_reveal", "seat": 1, "action": "bet", "amount": 2}
+            ],
+        }
+    )
+    assert decide_move(state) == {"action": "call"}
+
+
+def test_phase_two_learns_rule_from_showdowns_and_remembers_codename() -> None:
+    state = phase_two_state("persistent-onyx")
+    state["recent_hands"] = rule_history("low_card")
+    estimate = _equity_estimate(state, 1, 7)
+
+    assert estimate.model == "low_card"
+    assert estimate.confidence > 0.90
+    assert estimate.equity > 0.90
+
+    retry = phase_two_state("persistent-onyx")
+    retry["match_id"] = "phase2-attempt2-leg1"
+    remembered = _equity_estimate(retry, 13, 7)
+    assert remembered.model == "low_card"
+    assert remembered.observations == len(RULE_PROBES)
+    assert remembered.equity < 0.10
+
+    unrelated = _equity_estimate(phase_two_state("different-rule"), 13, 7)
+    assert unrelated.observations == 0
+    assert unrelated.confidence < 0.10
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "standard",
+        "pair_low",
+        "high_card",
+        "low_card",
+        "pair_bad_high",
+        "pair_bad_low",
+        "center_high",
+        "extreme_low",
+        "community_switch",
+        "community_switch_inverse",
+        "clockwise",
+        "counterclockwise",
+    ],
+)
+def test_phase_two_identifies_representative_hidden_rule_families(
+    candidate: str,
+) -> None:
+    state = phase_two_state(f"rule-{candidate}")
+    state["recent_hands"] = rule_history(candidate)
+    estimate = _equity_estimate(state, 8, 5)
+    assert estimate.model == candidate
+    assert estimate.confidence > 0.90
+
+
+def test_phase_two_uses_learned_rule_for_value_betting() -> None:
+    state = phase_two_state("reverse-ranking")
+    state.update(
+        {
+            "hand_number": 21,
+            "round": "post_reveal",
+            "your_number": 1,
+            "community_number": 7,
+            "pot": 8,
+            "to_call": 0,
+            "min_raise_to": 2,
+            "max_raise_to": 199,
+            "legal_actions": ["check", "bet"],
+            "current_hand_actions": [],
+            "recent_hands": rule_history("low_card"),
+        }
+    )
+    result = decide_move(state)
+    assert result["action"] == "bet"
+    assert state["min_raise_to"] <= result["amount"] <= state["max_raise_to"]
+
+
+def test_phase_two_protects_a_guaranteed_plus_twenty_five_leg() -> None:
+    state = phase_two_state()
+    state.update(
+        {
+            "hand_number": 39,
+            "your_stack": 240,
+            "round": "post_reveal",
+            "your_number": 7,
+            "community_number": 7,
+            "pot": 20,
+            "to_call": 8,
+            "min_raise_to": 16,
+            "max_raise_to": 240,
+            "legal_actions": ["fold", "call", "raise"],
+        }
+    )
+    state["players"][0]["stack"] = 240
     assert decide_move(state) == {"action": "fold"}
 
 

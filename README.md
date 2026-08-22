@@ -12,7 +12,7 @@ app/
     ├── adaptive_api.py             # Adaptive API Gateway
     ├── ghost_chains.py             # Ghost Chains Phase 1
     ├── tool_box.py                 # Tool Box Phase 1 MCP server
-    └── showdown.py                 # SHOWDOWN Phase 1 betting strategy
+    └── showdown.py                 # SHOWDOWN Phase 1-2 betting strategy
 tests/
 ├── test_adaptive_api.py
 ├── test_ghost_chains.py
@@ -198,7 +198,7 @@ The server advertises only three concise tools, well below the challenge limit
 of 20, and every tool returns a tiny result well below the 1,200-token limit.
 All computation is local and comfortably inside the 10-second response limit.
 
-## SHOWDOWN - Phase 1
+## SHOWDOWN - Phases 1 and 2
 
 Register the existing Render base URL with the SHOWDOWN evaluator. It calls:
 
@@ -206,17 +206,25 @@ Register the existing Render base URL with the SHOWDOWN evaluator. It calls:
 POST https://YOUR-EXISTING-SERVICE.onrender.com/move
 ```
 
-The bot is stateless and deterministic, so repeated delivery of the same turn
-produces the same move. Its strategy combines exact one-card showdown equity,
-pot odds, position, current stack risk, legal raise bounds, and opponent
-tendencies reconstructed from the supplied rolling history. It value-bets pairs
-and premium numbers, avoids high-risk marginal calls, and bluffs only at a
-frequency supported by observed folds.
+The Phase 1 strategy combines exact one-card showdown equity, pot odds, position,
+current stack risk, legal raise bounds, and opponent tendencies reconstructed
+from the supplied rolling history. It value-bets pairs and premium numbers,
+avoids high-risk marginal calls, and bluffs only at a frequency supported by
+observed folds.
+
+For Phase 2, the bot treats `table_rule` as an opaque stable identifier. It
+collects revealed two-player showdowns, scores a broad family of possible ranking
+rules, and computes equity as a confidence-weighted model rather than assuming
+standard rules. Early uncertain hands seek inexpensive reveals. Learned codenames
+remain in memory across legs and retries, so later attempts start with the rule
+knowledge acquired previously. Each Phase 2 leg uses a `+25` endgame lock once
+all remaining forced bets can no longer pull the result below the scoring target.
 
 Every response is selected from `legal_actions`; `amount` is returned only for
 `bet` or `raise` and is clamped to the coordinator-provided inclusive range.
 `GET /health` warms the whole service, while `GET /showdown/health` is available
-for challenge-specific checks.
+for challenge-specific checks. Render runs one worker so the Phase 2 rule memory
+is shared by every move handled by the deployed process.
 
 ## Add the next challenge
 

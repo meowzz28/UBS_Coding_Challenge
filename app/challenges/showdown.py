@@ -1,10 +1,12 @@
-"""SHOWDOWN Phase 1 betting strategy and HTTP routes."""
+"""SHOWDOWN Phase 1 and Phase 2 betting strategy and HTTP routes."""
 
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, Literal, TypedDict, cast
 
 from fastapi import APIRouter
@@ -12,6 +14,30 @@ from fastapi import APIRouter
 
 Action = Literal["check", "call", "bet", "raise", "fold"]
 AGGRESSIVE_ACTIONS = {"bet", "raise"}
+RULE_CANDIDATES = (
+    "standard",
+    "pair_low",
+    "high_card",
+    "low_card",
+    "pair_bad_high",
+    "pair_bad_low",
+    "closest_split",
+    "closest_high",
+    "closest_low",
+    "farthest_split",
+    "farthest_high",
+    "farthest_low",
+    "center_split",
+    "center_high",
+    "center_low",
+    "extreme_split",
+    "extreme_high",
+    "extreme_low",
+    "community_switch",
+    "community_switch_inverse",
+    "clockwise",
+    "counterclockwise",
+)
 
 
 class Move(TypedDict, total=False):
@@ -26,6 +52,28 @@ class OpponentProfile:
     fold_to_aggression: float
     aggression_rate: float
     observations: int
+
+
+@dataclass(frozen=True)
+class ShowdownObservation:
+    first_number: int
+    second_number: int
+    community: int
+    result: int
+
+
+@dataclass(frozen=True)
+class EquityEstimate:
+    equity: float
+    confidence: float
+    observations: int
+    model: str
+
+
+_RULE_MEMORY: dict[
+    str, dict[tuple[str, int, int, int, int, int], ShowdownObservation]
+] = {}
+_RULE_MEMORY_LOCK = Lock()
 
 
 router = APIRouter(tags=["showdown"])
@@ -45,7 +93,7 @@ def move(payload: dict[str, Any]) -> Move:
 
 
 def decide_move(state: Mapping[str, Any]) -> Move:
-    """Choose a Phase 1 move using equity, price, risk, and opponent history."""
+    """Choose a move using learned rules, equity, price, and opponent history."""
 
     legal = _legal_actions(state.get("legal_actions"))
     if not legal:
@@ -61,37 +109,45 @@ def decide_move(state: Mapping[str, Any]) -> Move:
     stack = max(0, _int(state.get("your_stack"), 0))
     own_bet = _own_round_bet(state)
     profile = _opponent_profile(state)
+    equity = _equity_estimate(state, number, community)
 
-    # Phase 1 is threshold-scored rather than proportional: once the live stack
-    # can absorb every remaining forced bet and still finish at +10, eliminate
-    # voluntary variance. Checking is free; fold only when chips are demanded.
-    if _phase_one_target_locked(state, stack):
+    # Both phases are threshold-scored. Once the live stack can absorb every
+    # remaining forced bet and retain the qualifying delta, remove variance.
+    if _phase_target_locked(state, stack):
         if to_call > 0:
             return _first_legal(legal, "fold", "call", "check")
         return _first_legal(legal, "check", "call", "fold")
+
+    # At the start of an opaque Phase 2 leg, reach inexpensive showdowns to learn
+    # its rule instead of risking chips based on the standard table assumption.
+    if (
+        _int(state.get("phase"), 0) == 2
+        and equity.observations < 8
+        and (equity.observations < 2 or equity.confidence < 0.55)
+    ):
+        return _learning_move(state, legal, to_call, pot, stack)
 
     if round_name == "post_reveal" and community is not None:
         return _post_reveal_move(
             state=state,
             legal=legal,
-            number=number,
-            community=community,
             to_call=to_call,
             pot=pot,
             stack=stack,
             own_bet=own_bet,
             profile=profile,
+            equity=equity.equity,
         )
 
     return _pre_reveal_move(
         state=state,
         legal=legal,
-        number=number,
         to_call=to_call,
         pot=pot,
         stack=stack,
         own_bet=own_bet,
         profile=profile,
+        equity=equity.equity,
     )
 
 
@@ -115,30 +171,253 @@ def pre_reveal_equity(your_number: int) -> float:
     return (11 * your_number + 7.5) / 169
 
 
+def _equity_estimate(
+    state: Mapping[str, Any], your_number: int, community: int | None
+) -> EquityEstimate:
+    phase = _int(state.get("phase"), 1)
+    if phase == 1:
+        equity = (
+            showdown_equity(your_number, community)
+            if community is not None
+            else pre_reveal_equity(your_number)
+        )
+        return EquityEstimate(equity, 1.0, 100, "standard")
+
+    rule_name = str(state.get("table_rule", ""))
+    _remember_showdowns(state, rule_name)
+    observations = _rule_observations(rule_name)
+    weights = _candidate_weights(observations)
+    model = RULE_CANDIDATES[max(range(len(weights)), key=weights.__getitem__)]
+    confidence = max(weights)
+
+    if community is None:
+        total = 0.0
+        for candidate, weight in zip(RULE_CANDIDATES, weights, strict=True):
+            candidate_total = (
+                sum(
+                    _candidate_equity(candidate, your_number, revealed)
+                    for revealed in range(1, 14)
+                )
+                / 13
+            )
+            total += weight * candidate_total
+    else:
+        total = sum(
+            weight * _candidate_equity(candidate, your_number, community)
+            for candidate, weight in zip(RULE_CANDIDATES, weights, strict=True)
+        )
+    return EquityEstimate(total, confidence, len(observations), model)
+
+
+def _remember_showdowns(state: Mapping[str, Any], rule_name: str) -> None:
+    histories = state.get("recent_hands")
+    if (
+        not rule_name
+        or not isinstance(histories, Sequence)
+        or isinstance(histories, (str, bytes))
+    ):
+        return
+
+    match_id = str(state.get("match_id", ""))
+    leg_number = _int(state.get("leg_number"), 0)
+    additions: dict[tuple[str, int, int, int, int, int], ShowdownObservation] = {}
+    for hand in histories:
+        if not isinstance(hand, Mapping):
+            continue
+        community = _optional_bounded_int(hand.get("community_number"), 1, 13)
+        shown = hand.get("shown_numbers")
+        winners = hand.get("winners")
+        hand_number = _int(hand.get("hand_number"), 0)
+        if (
+            community is None
+            or not isinstance(shown, Mapping)
+            or not isinstance(winners, Sequence)
+            or isinstance(winners, (str, bytes))
+            or hand_number < 1
+        ):
+            continue
+
+        seats: list[tuple[int, int]] = []
+        for raw_seat, raw_number in shown.items():
+            try:
+                seat = int(raw_seat)
+            except (TypeError, ValueError):
+                continue
+            number = _optional_bounded_int(raw_number, 1, 13)
+            if number is not None:
+                seats.append((seat, number))
+        if len(seats) != 2:
+            continue
+        seats.sort()
+        winner_seats = {
+            winner
+            for winner in winners
+            if isinstance(winner, int) and not isinstance(winner, bool)
+        }
+        if winner_seats == {seats[0][0], seats[1][0]}:
+            result = 0
+        elif winner_seats == {seats[0][0]}:
+            result = 1
+        elif winner_seats == {seats[1][0]}:
+            result = -1
+        else:
+            continue
+
+        key = (
+            match_id,
+            leg_number,
+            hand_number,
+            seats[0][1],
+            seats[1][1],
+            community,
+        )
+        additions[key] = ShowdownObservation(
+            seats[0][1], seats[1][1], community, result
+        )
+
+    if additions:
+        with _RULE_MEMORY_LOCK:
+            memory = _RULE_MEMORY.setdefault(rule_name, {})
+            memory.update(additions)
+            while len(memory) > 500:
+                memory.pop(next(iter(memory)))
+
+
+def _rule_observations(rule_name: str) -> tuple[ShowdownObservation, ...]:
+    with _RULE_MEMORY_LOCK:
+        return tuple(_RULE_MEMORY.get(rule_name, {}).values())
+
+
+def _candidate_weights(
+    observations: Sequence[ShowdownObservation],
+) -> tuple[float, ...]:
+    if not observations:
+        uniform = 1 / len(RULE_CANDIDATES)
+        return (uniform,) * len(RULE_CANDIDATES)
+
+    scores: list[float] = []
+    for candidate in RULE_CANDIDATES:
+        errors = sum(
+            _compare_rule(
+                candidate,
+                observation.first_number,
+                observation.second_number,
+                observation.community,
+            )
+            != observation.result
+            for observation in observations
+        )
+        scores.append(-3.5 * errors)
+    peak = max(scores)
+    raw = [math.exp(score - peak) for score in scores]
+    total = sum(raw)
+    return tuple(weight / total for weight in raw)
+
+
+def _candidate_equity(candidate: str, your_number: int, community: int) -> float:
+    points = 0.0
+    for opponent_number in range(1, 14):
+        result = _compare_rule(candidate, your_number, opponent_number, community)
+        points += 1.0 if result > 0 else 0.5 if result == 0 else 0.0
+    return points / 13
+
+
+def _compare_rule(candidate: str, first: int, second: int, community: int) -> int:
+    first_rank = _rule_rank(candidate, first, community)
+    second_rank = _rule_rank(candidate, second, community)
+    return (first_rank > second_rank) - (first_rank < second_rank)
+
+
+def _rule_rank(candidate: str, number: int, community: int) -> tuple[int, ...]:
+    pair = int(number == community)
+    distance = abs(number - community)
+    center_distance = abs(number - 7)
+    if candidate == "standard":
+        return (pair, number)
+    if candidate == "pair_low":
+        return (pair, -number)
+    if candidate == "high_card":
+        return (number,)
+    if candidate == "low_card":
+        return (-number,)
+    if candidate == "pair_bad_high":
+        return (-pair, number)
+    if candidate == "pair_bad_low":
+        return (-pair, -number)
+    if candidate.startswith("closest"):
+        return _distance_rank(candidate, -distance, number)
+    if candidate.startswith("farthest"):
+        return _distance_rank(candidate, distance, number)
+    if candidate.startswith("center"):
+        return _distance_rank(candidate, -center_distance, number)
+    if candidate.startswith("extreme"):
+        return _distance_rank(candidate, center_distance, number)
+    if candidate == "community_switch":
+        return (number if community <= 7 else -number,)
+    if candidate == "community_switch_inverse":
+        return (-number if community <= 7 else number,)
+    if candidate == "clockwise":
+        return ((number - community) % 13,)
+    if candidate == "counterclockwise":
+        return ((community - number) % 13,)
+    raise ValueError(f"unknown rule candidate: {candidate}")
+
+
+def _distance_rank(candidate: str, primary: int, number: int) -> tuple[int, ...]:
+    if candidate.endswith("_high"):
+        return (primary, number)
+    if candidate.endswith("_low"):
+        return (primary, -number)
+    return (primary,)
+
+
+def _learning_move(
+    state: Mapping[str, Any],
+    legal: set[Action],
+    to_call: int,
+    pot: int,
+    stack: int,
+) -> Move:
+    if to_call == 0:
+        return _first_legal(legal, "check", "call", "fold")
+
+    round_name = str(state.get("round", "pre_reveal"))
+    actions = _actions(state.get("current_hand_actions"))
+    small_blind = max(1, _int(state.get("small_blind"), 1))
+    blind_completion = (
+        round_name == "pre_reveal" and not actions and to_call <= small_blind
+    )
+    cheap_showdown = (
+        round_name == "post_reveal"
+        and to_call <= max(2, round(pot * 0.35))
+        and to_call <= max(2, round(stack * 0.08))
+    )
+    if "call" in legal and (blind_completion or cheap_showdown):
+        return {"action": "call"}
+    return _first_legal(legal, "fold", "call", "check")
+
+
 def _post_reveal_move(
     *,
     state: Mapping[str, Any],
     legal: set[Action],
-    number: int,
-    community: int,
     to_call: int,
     pot: int,
     stack: int,
     own_bet: int,
     profile: OpponentProfile,
+    equity: float,
 ) -> Move:
-    equity = showdown_equity(number, community)
-    is_pair = number == community
+    is_nuts = equity >= 0.93
     facing_bet = to_call > 0
 
     if facing_bet:
         price = _pot_odds(to_call, pot)
         risk = to_call / max(1, stack)
 
-        # A pair is the nuts in this game. It loses to nothing and only splits
-        # against the opponent holding the same number, so build the pot whenever
-        # raising remains legal.
-        if is_pair:
+        # Build the pot with hands that are effectively the nuts under the
+        # inferred table rule. Under standard rules this is exactly a pair.
+        if is_nuts:
             if _can_aggress(legal):
                 fraction = 1.35 if profile.fold_to_aggression < 0.38 else 0.80
                 return _aggressive_move(state, legal, own_bet, to_call, pot, fraction)
@@ -152,14 +431,9 @@ def _post_reveal_move(
             1.0,
         )
 
-        # Raise premium non-pair hands for value without turning a marginal edge
-        # into an unnecessary tournament-sized pot.
-        if (
-            number >= 12
-            and adjusted_equity >= 0.78
-            and risk <= 0.30
-            and _can_aggress(legal)
-        ):
+        # Raise premium hands for value without turning a marginal edge into an
+        # unnecessary tournament-sized pot.
+        if adjusted_equity >= 0.78 and risk <= 0.30 and _can_aggress(legal):
             return _aggressive_move(state, legal, own_bet, to_call, pot, 0.65)
 
         call_margin = 0.035 if profile.aggression_rate >= 0.45 else 0.065
@@ -168,9 +442,9 @@ def _post_reveal_move(
             return {"action": "call"}
         return _first_legal(legal, "fold", "call", "check")
 
-    # When checked to, value bet the strongest portion of the range. Occasionally
-    # checking a pair against an aggressive opponent preserves an inducing line.
-    if is_pair:
+    # When checked to, value bet the strongest portion of the rule-specific range.
+    # Occasionally checking the nuts against aggression preserves an inducing line.
+    if is_nuts:
         trap = profile.aggression_rate >= 0.48 and _mix(state, "pair-trap") < 0.16
         if not trap and _can_aggress(legal):
             fraction = 0.95 if profile.fold_to_aggression < 0.42 else 0.62
@@ -200,14 +474,13 @@ def _pre_reveal_move(
     *,
     state: Mapping[str, Any],
     legal: set[Action],
-    number: int,
     to_call: int,
     pot: int,
     stack: int,
     own_bet: int,
     profile: OpponentProfile,
+    equity: float,
 ) -> Move:
-    equity = pre_reveal_equity(number)
     small_blind = max(1, _int(state.get("small_blind"), 1))
     actions = _actions(state.get("current_hand_actions"))
     blind_completion = to_call <= small_blind and not actions
@@ -215,10 +488,10 @@ def _pre_reveal_move(
     # The button's opening decision is a one-chip completion rather than evidence
     # of opponent strength. Continue nearly every hand that is getting the price.
     if blind_completion:
-        if number >= 10 and _can_aggress(legal):
-            fraction = 0.72 if number >= 12 else 0.52
+        if equity >= 0.68 and _can_aggress(legal):
+            fraction = 0.72 if equity >= 0.79 else 0.52
             return _aggressive_move(state, legal, own_bet, to_call, pot, fraction)
-        if number >= 3 and "call" in legal:
+        if equity >= 0.22 and "call" in legal:
             return {"action": "call"}
         return _first_legal(legal, "fold", "call", "check")
 
@@ -231,28 +504,23 @@ def _pre_reveal_move(
             1.0,
         )
 
-        if (
-            number >= 12
-            and risk <= 0.24
-            and adjusted_equity >= 0.76
-            and _can_aggress(legal)
-        ):
+        if risk <= 0.24 and adjusted_equity >= 0.76 and _can_aggress(legal):
             return _aggressive_move(state, legal, own_bet, to_call, pot, 0.62)
 
         # Avoid calling off most of the match with a hand that has not yet seen the
-        # community number. The top number remains profitable against wide shoves.
-        affordable = risk <= 0.38 or (number == 13 and adjusted_equity >= 0.84)
+        # community number. Only top rule-specific equity can call a wide shove.
+        affordable = risk <= 0.38 or adjusted_equity >= 0.84
         margin = 0.075 if profile.aggression_rate < 0.40 else 0.045
         if "call" in legal and affordable and adjusted_equity >= price + margin:
             return {"action": "call"}
         return _first_legal(legal, "fold", "call", "check")
 
-    if number >= 11 and _can_aggress(legal):
+    if equity >= 0.74 and _can_aggress(legal):
         return _aggressive_move(state, legal, own_bet, 0, pot, 0.62)
-    if number >= 9 and _can_aggress(legal):
+    if equity >= 0.62 and _can_aggress(legal):
         return _aggressive_move(state, legal, own_bet, 0, pot, 0.42)
 
-    if _can_aggress(legal) and number <= 3:
+    if _can_aggress(legal) and equity <= 0.25:
         bluff_rate = _clamp(
             0.04 + (profile.fold_to_aggression - 0.40) * 0.40,
             0.02,
@@ -337,6 +605,8 @@ def _aggressive_move(
     if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < minimum:
         return _first_legal(legal - {action}, "call", "check", "fold")
 
+    if _int(state.get("phase"), 1) == 2:
+        pot_fraction *= 1.20
     desired = own_bet + to_call + max(1, round(pot * pot_fraction))
     amount = max(minimum, min(maximum, desired))
     return {"action": action, "amount": amount}
@@ -372,8 +642,10 @@ def _own_round_bet(state: Mapping[str, Any]) -> int:
     return 0
 
 
-def _phase_one_target_locked(state: Mapping[str, Any], live_stack: int) -> bool:
-    if _int(state.get("phase"), 0) != 1:
+def _phase_target_locked(state: Mapping[str, Any], live_stack: int) -> bool:
+    phase = _int(state.get("phase"), 0)
+    targets = {1: 10, 2: 25}
+    if phase not in targets:
         return False
 
     hand = _int(state.get("hand_number"), 0)
@@ -391,7 +663,12 @@ def _phase_one_target_locked(state: Mapping[str, Any], live_stack: int) -> bool:
     for _ in range(hand + 1, total + 1):
         future_cost += small_blind if future_button == your_seat else big_blind
         future_button = 1 - future_button
-    return live_stack - future_cost >= starting_stack + 10
+    return live_stack - future_cost >= starting_stack + targets[phase]
+
+
+def _clear_rule_memory_for_tests() -> None:
+    with _RULE_MEMORY_LOCK:
+        _RULE_MEMORY.clear()
 
 
 def _first_legal(legal: set[Action], *preferences: Action) -> Move:
