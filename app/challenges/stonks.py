@@ -14,171 +14,119 @@ class TestCase(BaseModel):
     capital: int
     timeline: Dict[str, Dict[str, StockInfo]]
 
+import heapq
+from typing import Dict, List
+
 def solve_test_case(tc: TestCase) -> List[str]:
     prices = {}
-    initial_avail = {}
-    all_years = []
+    all_years = set([2037])
     
-    # Parse the timeline
+    # Map all available stock prices
     for y_str, stocks in tc.timeline.items():
         y = int(y_str)
-        if y not in all_years:
-            all_years.append(y)
-            prices[y] = {}
+        all_years.add(y)
+        prices[y] = {s: d.price for s, d in stocks.items()}
+
+    all_years = sorted(list(all_years), reverse=True)
+    initial_avail = {y: {s: d.qty for s, d in stocks.items()} for y_str, stocks in tc.timeline.items()}
+    for y in all_years:
+        if y not in initial_avail:
             initial_avail[y] = {}
-        for s_name, s_data in stocks.items():
-            prices[y][s_name] = s_data.price
-            initial_avail[y][s_name] = s_data.qty
 
-    # Ensure 2037 is always present since we must start and return there
-    if 2037 not in all_years:
-        all_years.append(2037)
-        prices[2037] = {}
-        initial_avail[2037] = {}
-
-    all_years.sort(reverse=True)
-    best_profit = -1
+    # Priority Queue state: (-capital, energy_left, current_year, path_history, inventory, availability)
+    pq = [(-tc.capital, tc.energy, 2037, [], {}, initial_avail)]
+    visited = {}
     best_path = []
-    memo = {}
+    best_profit = -1
 
-    def get_avail_hash(avail: Dict[int, Dict[str, int]]) -> tuple:
-        return tuple(sorted((y, tuple(sorted(v.items()))) for y, v in avail.items()))
+    while pq:
+        neg_cap, energy, year, path, inv, avail = heapq.heappop(pq)
+        cap = -neg_cap
 
-    def dfs(current_year: int, energy_left: int, capital: int, inventory: Dict[str, int], avail: Dict[int, Dict[str, int]], path_so_far: List[str]):
-        nonlocal best_profit, best_path
+        # Valid exit condition
+        if year == 2037 and cap > best_profit:
+            best_profit = cap
+            best_path = path
 
-        state_key = (current_year, energy_left, tuple(sorted(inventory.items())), get_avail_hash(avail))
-        if state_key in memo and memo[state_key] >= capital:
-            return
-        memo[state_key] = capital
+        if energy == 0 and year != 2037:
+            continue
 
-        if current_year == 2037:
-            if capital > best_profit:
-                best_profit = capital
-                best_path = path_so_far
+        # Prune heavily visited, less profitable states
+        state_key = (year, energy)
+        if state_key in visited and visited[state_key] >= cap:
+            continue
+        visited[state_key] = cap
 
-        # Determine sell actions
-        held_stocks = [s for s, q in inventory.items() if q > 0]
-        must_sell, optional_sell = [], []
-        for s in held_stocks:
-            current_p = prices[current_year].get(s, 0)
-            max_future_p = 0
-            for y in all_years:
-                if y != current_year and s in prices.get(y, {}):
-                    req_energy = abs(current_year - y) + abs(y - 2037)
-                    if req_energy <= energy_left and prices[y][s] > max_future_p:
-                        max_future_p = prices[y][s]
-            
-            if current_p >= max_future_p and current_p > 0:
-                must_sell.append(s)
-            elif current_p > 0:
-                optional_sell.append(s)
+        # 1. Greedy Sell Phase
+        new_cap = cap
+        new_inv = dict(inv)
+        sell_actions = []
+        for s, q in inv.items():
+            if q > 0 and s in prices.get(year, {}):
+                current_p = prices[year][s]
+                higher_reachable = False
+                for target_y in all_years:
+                    if target_y == year or s not in prices.get(target_y, {}): continue
+                    cost = abs(year - target_y) + abs(target_y - 2037)
+                    if cost <= energy and prices[target_y][s] > current_p:
+                        higher_reachable = True
+                        break
+                # Only sell if we have hit the highest reachable future peak
+                if not higher_reachable:
+                    new_cap += q * current_p
+                    new_inv[s] = 0
+                    sell_actions.append(f"s-{s}-{q}")
 
-        sell_subsets = []
-        for L in range(len(optional_sell) + 1):
-            for subset in itertools.combinations(optional_sell, L):
-                sell_subsets.append(must_sell + list(subset))
-
-        # Explore all valid sell and buy combinations
-        for sell_subset in sell_subsets:
-            new_cap = capital
-            new_inv = dict(inventory)
-            sell_actions = []
-            valid_sell = True
-            
-            for s in sell_subset:
-                if s not in prices.get(current_year, {}):
-                    valid_sell = False
-                    break
-                q = new_inv[s]
-                new_cap += q * prices[current_year][s]
-                new_inv[s] = 0
-                sell_actions.append(f"s-{s}-{q}")
-
-            if not valid_sell:
-                continue
-
-            available_here = avail[current_year]
-            buyable_stocks = []
-            for s, q in available_here.items():
-                if q == 0: continue
-                current_p = prices.get(current_year, {}).get(s, 0)
-                if current_p == 0 or current_p > new_cap: continue
-
+        # 2. Greedy Buy Phase (Fractional Knapsack)
+        new_avail = {y: dict(v) for y, v in avail.items()}
+        buy_actions = []
+        buyable = []
+        
+        for s, q in avail.get(year, {}).items():
+            if q > 0:
+                current_p = prices[year].get(s, 0)
                 max_future_p = 0
-                for y in all_years:
-                    if y != current_year and s in prices.get(y, {}):
-                        req_energy = abs(current_year - y) + abs(y - 2037)
-                        if req_energy <= energy_left and prices[y][s] > max_future_p:
-                            max_future_p = prices[y][s]
+                for target_y in all_years:
+                    if target_y == year or s not in prices.get(target_y, {}): continue
+                    cost = abs(year - target_y) + abs(target_y - 2037)
+                    if cost <= energy and prices[target_y][s] > max_future_p:
+                        max_future_p = prices[target_y][s]
                 
                 if max_future_p > current_p:
-                    buyable_stocks.append((s, max_future_p / current_p))
+                    buyable.append((max_future_p / current_p, s, current_p))
 
-            # Prioritize highest ROI to prevent combinatorial explosion
-            buyable_stocks.sort(key=lambda x: x[1], reverse=True)
-            top_buyable = [x[0] for x in buyable_stocks[:5]]
+        # Lock in the highest ROI trades first
+        buyable.sort(key=lambda x: x[0], reverse=True)
+        for roi, s, p in buyable:
+            max_q_affordable = new_cap // p
+            q_to_buy = min(max_q_affordable, new_avail[year][s])
+            if q_to_buy > 0:
+                new_cap -= q_to_buy * p
+                new_avail[year][s] -= q_to_buy
+                new_inv[s] = new_inv.get(s, 0) + q_to_buy
+                buy_actions.append(f"b-{s}-{q_to_buy}")
 
-            combos = set([tuple()])
-            for perm in itertools.permutations(top_buyable):
-                for bL in range(1, len(perm) + 1):
-                    cap = new_cap
-                    combo = {}
-                    for s in perm[:bL]:
-                        p = prices[current_year][s]
-                        q = min(avail[current_year][s], cap // p)
-                        if q > 0:
-                            combo[s] = q
-                            cap -= q * p
-                    if combo:
-                        combos.add(tuple(sorted(combo.items())))
+        current_actions = sell_actions + buy_actions
+        new_path = path + current_actions
 
-            for buy_combo in combos:
-                final_cap = new_cap
-                final_avail = {y: dict(v) for y, v in avail.items()}
-                final_inv = dict(new_inv)
-                buy_actions = []
+        if year == 2037 and not current_actions and path:
+            continue
 
-                for s, q in buy_combo:
-                    final_cap -= q * prices[current_year][s]
-                    final_avail[current_year][s] -= q
-                    final_inv[s] = final_inv.get(s, 0) + q
-                    buy_actions.append(f"b-{s}-{q}")
+        # 3. Jump Phase
+        for target_y in all_years:
+            if target_y != year:
+                cost = abs(year - target_y)
+                # Ensure we retain enough energy to return home
+                if cost <= energy - abs(target_y - 2037):
+                    heapq.heappush(pq, (
+                        -new_cap,
+                        energy - cost,
+                        target_y,
+                        new_path + [f"j-{year}-{target_y}"],
+                        new_inv,
+                        new_avail
+                    ))
 
-                current_actions = sell_actions + buy_actions
-
-                if current_year == 2037 and energy_left == 0:
-                    if final_cap > best_profit:
-                        best_profit = final_cap
-                        best_path = path_so_far + current_actions
-                    continue
-
-                is_start = (not path_so_far and not current_actions and current_year == 2037)
-                if not current_actions and not is_start:
-                    if current_year == 2037 and final_cap > best_profit:
-                        best_profit = final_cap
-                        best_path = path_so_far
-                    continue
-
-                if current_year == 2037 and final_cap > best_profit:
-                    best_profit = final_cap
-                    best_path = path_so_far + current_actions
-
-                # Jump generation
-                for target_year in all_years:
-                    if target_year != current_year:
-                        cost = abs(current_year - target_year)
-                        if cost <= energy_left - abs(target_year - 2037):
-                            dfs(
-                                target_year,
-                                energy_left - cost,
-                                final_cap,
-                                final_inv,
-                                final_avail,
-                                path_so_far + current_actions + [f"j-{current_year}-{target_year}"]
-                            )
-
-    dfs(2037, tc.energy, tc.capital, {}, initial_avail, [])
     return best_path
 
 @router.post("/stonks")
