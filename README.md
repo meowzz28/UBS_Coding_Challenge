@@ -11,11 +11,13 @@ app/
 └── challenges/
     ├── adaptive_api.py             # Adaptive API Gateway
     ├── ghost_chains.py             # Ghost Chains Phase 1
-    └── tool_box.py                 # Tool Box Phase 1 MCP server
+    ├── tool_box.py                 # Tool Box Phase 1 MCP server
+    └── showdown.py                 # SHOWDOWN Phase 1 betting strategy
 tests/
 ├── test_adaptive_api.py
 ├── test_ghost_chains.py
-└── test_tool_box.py
+├── test_tool_box.py
+└── test_showdown.py
 render.yaml                         # Existing Render service configuration
 ```
 
@@ -34,6 +36,9 @@ Adding another challenge does not require another server or Render deployment.
 | Ghost Chains | `POST` | `/ghost-chains/transactions` |
 | Tool Box | MCP | `/mcp` |
 | Tool Box | `GET` | `/tool-box/health` |
+| SHOWDOWN | `POST` | `/move` |
+| SHOWDOWN | `POST` | `/showdown/move` |
+| SHOWDOWN | `GET` | `/showdown/health` |
 
 The original `/solve` endpoint remains unchanged so the already-configured
 Adaptive API evaluation continues to work. New challenges use a namespaced path
@@ -192,6 +197,26 @@ sessionless protocol on the same `/mcp` endpoint.
 The server advertises only three concise tools, well below the challenge limit
 of 20, and every tool returns a tiny result well below the 1,200-token limit.
 All computation is local and comfortably inside the 10-second response limit.
+
+## SHOWDOWN - Phase 1
+
+Register the existing Render base URL with the SHOWDOWN evaluator. It calls:
+
+```text
+POST https://YOUR-EXISTING-SERVICE.onrender.com/move
+```
+
+The bot is stateless and deterministic, so repeated delivery of the same turn
+produces the same move. Its strategy combines exact one-card showdown equity,
+pot odds, position, current stack risk, legal raise bounds, and opponent
+tendencies reconstructed from the supplied rolling history. It value-bets pairs
+and premium numbers, avoids high-risk marginal calls, and bluffs only at a
+frequency supported by observed folds.
+
+Every response is selected from `legal_actions`; `amount` is returned only for
+`bet` or `raise` and is clamped to the coordinator-provided inclusive range.
+`GET /health` warms the whole service, while `GET /showdown/health` is available
+for challenge-specific checks.
 
 ## Add the next challenge
 

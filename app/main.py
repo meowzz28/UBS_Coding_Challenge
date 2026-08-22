@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.challenges import adaptive_api, ghost_chains, tool_box
+from app.challenges import adaptive_api, ghost_chains, showdown, tool_box
 
 
 @asynccontextmanager
@@ -16,13 +16,14 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title="UBS Coding Challenge Server",
     description="One deployable FastAPI service containing independent challenge routers.",
-    version="3.0.0",
+    version="4.0.0",
     lifespan=lifespan,
 )
 
 app.include_router(adaptive_api.router)
 app.include_router(ghost_chains.router)
 app.include_router(tool_box.router)
+app.include_router(showdown.router)
 
 
 @app.get("/", tags=["service"])
@@ -38,6 +39,7 @@ def service_info() -> dict[str, object]:
                 "/ghost-chains/transactions",
             ],
             "toolBox": ["/mcp", "/tool-box/health"],
+            "showdown": ["/move", "/showdown/move", "/showdown/health"],
         },
     }
 
