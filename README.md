@@ -1,16 +1,39 @@
-# UBS Adaptive API Gateway Challenge
+# UBS Coding Challenge Server
 
-A FastAPI solution for the Adaptive API Gateway challenge. The server accepts a
-Base64-encoded V1 JSON model and returns the transformed V2 model.
+One FastAPI service for multiple UBS coding challenges. Each challenge lives in
+its own router, while a single `app.main:app` process is deployed to Render.
 
-## Transformation
+## Repository structure
 
-`POST /solve` performs these changes:
+```text
+app/
+├── main.py                         # FastAPI entry point and router registration
+└── challenges/
+    ├── adaptive_api.py             # Adaptive API Gateway
+    └── ghost_chains.py             # Ghost Chains Phase 1
+tests/
+├── test_adaptive_api.py
+└── test_ghost_chains.py
+render.yaml                         # Existing Render service configuration
+```
 
-- `adaptInput.user.id` becomes `adaptOutput.id`
-- `adaptInput.user.fullName` becomes `adaptOutput.name`
-- `adaptInput.action` is converted to lowercase
-- priorities map as `LOW = 1`, `MEDIUM = 2`, and `HIGH = 3`
+This structure keeps challenge models, state, algorithms, and routes separate.
+Adding another challenge does not require another server or Render deployment.
+
+## Available APIs
+
+| Challenge | Method | Endpoint |
+| --- | --- | --- |
+| Service | `GET` | `/health` |
+| Adaptive API | `POST` | `/solve` |
+| Adaptive API | `POST` | `/adaptive-api/solve` |
+| Ghost Chains | `GET` | `/ghost-chains/health` |
+| Ghost Chains | `POST` | `/ghost-chains/reset` |
+| Ghost Chains | `POST` | `/ghost-chains/transactions` |
+
+The original `/solve` endpoint remains unchanged so the already-configured
+Adaptive API evaluation continues to work. New challenges use a namespaced path
+to avoid route collisions.
 
 ## Run locally
 
@@ -23,81 +46,124 @@ python -m pip install -r requirements-dev.txt
 uvicorn app.main:app --reload
 ```
 
-The API runs at <http://127.0.0.1:8000>. Interactive documentation is available
-at <http://127.0.0.1:8000/docs>.
+The API runs at <http://127.0.0.1:8000>. Interactive OpenAPI documentation is at
+<http://127.0.0.1:8000/docs>.
 
-Test the challenge request:
-
-```bash
-curl -X POST http://127.0.0.1:8000/solve \
-  -H 'Content-Type: application/json' \
-  -d '{"payload":"ewoJImFkYXB0SW5wdXQiOiB7CgkJInVzZXIiOiB7CgkJCSJpZCI6ICJVNDIiLAoJCQkiZnVsbE5hbWUiOiAiSmFuZSBEb2UiCgkJfSwKCQkiYWN0aW9uIjogIkNSRUFURSIsCgkJIm1ldGFkYXRhIjogewoJCQkicHJpb3JpdHkiOiAiSElHSCIKCQl9Cgl9Cn0="}'
-```
-
-Expected response:
-
-```json
-{
-  "adaptOutput": {
-    "id": "U42",
-    "name": "Jane Doe",
-    "action": "create",
-    "priority": 3
-  }
-}
-```
-
-Run the tests with:
+Run every challenge test:
 
 ```bash
 pytest
 ```
 
-## Push to GitHub
+## Adaptive API Gateway
 
-From this project directory:
+`POST /solve` and `POST /adaptive-api/solve` both decode the Base64 payload and
+perform the original transformation:
+
+- `adaptInput.user.id` becomes `adaptOutput.id`
+- `adaptInput.user.fullName` becomes `adaptOutput.name`
+- `adaptInput.action` is converted to lowercase
+- priorities map as `LOW = 1`, `MEDIUM = 2`, and `HIGH = 3`
+
+## Ghost Chains - Phase 1
+
+The Ghost Chains implementation maintains an in-memory directed transaction
+multigraph. It processes each request array sequentially and scores the current
+transaction before adding it to the graph.
+
+The Phase 1 score combines structural signals including:
+
+- isolated transfers and ordinary one-way extensions
+- shared-ancestor convergence
+- new direct edges that shorten existing paths
+- return edges that close directed cycles
+- additional return routes into nodes already participating in cycles
+
+Scores are deterministic numbers from `0.0` through `1.0`. Transactions older
+than the 24-hour watermark are removed from graph state. An identical duplicate
+`txId` returns its original score without mutating state; reusing a `txId` with a
+different payload returns HTTP `409`. Optional and unknown fields are accepted so
+later phases can extend the transaction model.
+
+### Smoke test
+
+Reset state before a new evaluation:
 
 ```bash
-git init
-git branch -M main
+curl -X POST http://127.0.0.1:8000/ghost-chains/reset \
+  -H 'Content-Type: application/json' \
+  -d '{"clearTransactions":true}'
+```
+
+Submit an ordered transaction batch:
+
+```bash
+curl -X POST http://127.0.0.1:8000/ghost-chains/transactions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "transactions": [
+      {
+        "txId": "tx_meridian_001",
+        "fromUserId": "meridian_holdings",
+        "toUserId": "apex_logistics",
+        "amount": 370.0,
+        "createdAt": "2026-06-08T12:00:00Z"
+      }
+    ]
+  }'
+```
+
+Response shape:
+
+```json
+{
+  "transactions": [
+    {"txId": "tx_meridian_001", "riskScore": 0.02}
+  ]
+}
+```
+
+## Deploy updates to the existing Render service
+
+No new server is needed. Commit and push the new router to the same `main` branch:
+
+```bash
 git add .
-git commit -m "Build Adaptive API Gateway challenge server"
-git remote add origin https://github.com/meowzz28/UBS_Coding_Challenge.git
-git push -u origin main
+git commit -m "Add modular Ghost Chains Phase 1 API"
+git push origin main
 ```
 
-GitHub will ask you to authenticate if your computer is not already signed in.
-For HTTPS, use a personal access token instead of an account password, or sign in
-with the GitHub CLI by running `gh auth login` before pushing.
+Render's automatic deployment will update the existing service. Keep the same
+base URL and register these Ghost Chains endpoints beneath it:
 
-If the GitHub repository already contains commits, clone it first or pull its
-history before pushing; do not force-push over work you want to keep.
-
-## Deploy on Render's free tier
-
-The included `render.yaml` describes the service, start command, and health check.
-
-1. Push this repository to GitHub.
-2. Sign in at <https://dashboard.render.com>.
-3. Choose **New > Blueprint**.
-4. Connect GitHub and select `meowzz28/UBS_Coding_Challenge`.
-5. Confirm the Blueprint and choose the **Free** instance if prompted.
-6. Wait for the deploy to finish and copy the generated `onrender.com` URL.
-7. Give the competition server `https://YOUR-SERVICE.onrender.com/solve`.
-
-Every push to `main` will trigger a new deployment. The free service may sleep
-after a period without traffic, so the first request after inactivity can be slow.
-
-You can verify the deployed service with:
-
-```bash
-curl https://YOUR-SERVICE.onrender.com/health
+```text
+https://YOUR-EXISTING-SERVICE.onrender.com/ghost-chains/health
+https://YOUR-EXISTING-SERVICE.onrender.com/ghost-chains/reset
+https://YOUR-EXISTING-SERVICE.onrender.com/ghost-chains/transactions
 ```
 
-## Adding more challenge questions
+If the coordinator asks for a public base URL instead of individual endpoints,
+provide:
 
-If the competition expects one callback URL, keeping the challenges in one repo
-and adding new routes/modules is usually simpler than maintaining one repository
-per question. If each question must expose its own `/solve` URL, create one folder
-and one Render service per question, or use separate repositories as originally
-planned.
+```text
+https://YOUR-EXISTING-SERVICE.onrender.com
+```
+
+The service uses one Uvicorn worker so all Ghost Chains requests share the same
+in-memory graph. A process restart restores clean startup state, and the evaluator
+can explicitly establish that state through `/ghost-chains/reset`.
+
+## Add the next challenge
+
+1. Create `app/challenges/<challenge_name>.py` with an `APIRouter` using a unique
+   prefix such as `/<challenge-name>`.
+2. Import the module in `app/challenges/__init__.py`.
+3. Register its router in `app/main.py`.
+4. Add an independent test file under `tests/`.
+5. Push to `main`; Render deploys the updated single service automatically.
+
+The Render start command remains unchanged:
+
+```text
+uvicorn app.main:app --host 0.0.0.0 --port $PORT
+```
