@@ -18,6 +18,7 @@ from app.challenges.tool_box import (
     identify_shape,
     next_journey_node,
     recall_study_material,
+    search,
     server,
 )
 from app.main import app
@@ -159,6 +160,33 @@ def test_recall_returns_relevant_passages_within_exact_token_budget(
     assert sum(len(encoding.encode(passage)) for passage in passages) <= 900
 
 
+def test_search_contract_and_indirect_facility_staffing_question(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tool_box,
+        "_study_chunks",
+        (
+            StudyChunk(
+                1,
+                "Study material 1 — Staffing Roster",
+                "Study material 1 — Staffing Roster\nThe station maintains a resident population of forty-one scientists and technicians, spread across three rotating shifts so the habitat is never left unstaffed.",
+            ),
+            StudyChunk(
+                4,
+                "Study material 4 — Leadership and Team Structure",
+                "Study material 4 — Leadership and Team Structure\nThe core engine group maintains thirty-two engineers working simultaneously across four teams.",
+            ),
+        ),
+    )
+
+    passages = search(
+        "Roughly how many personnel live aboard the facility simultaneously?"
+    )
+
+    assert "forty-one" in passages[0]
+
+
 def test_least_cost_route_includes_entry_tolls_and_standard_hop_limit() -> None:
     adjacency = {
         "A": {"B": 4.0, "C": 2.0, "D": 20.0},
@@ -203,8 +231,8 @@ def test_school_trip_place_name_resolves_to_documented_stop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     graph = {
-        "adjacency": {"START": {"STOP_05": 2.0}, "STOP_05": {}},
-        "tolls": {"START": 0.0, "STOP_05": 1.0},
+        "adjacency": {"SITE_1": {"SITE_5": 2.0}, "SITE_5": {}},
+        "tolls": {"SITE_1": 0.0, "SITE_5": 1.0},
     }
     monkeypatch.setattr(tool_box, "_get_graph", lambda _: graph)
     monkeypatch.setattr(
@@ -220,7 +248,7 @@ def test_school_trip_place_name_resolves_to_documented_stop(
     )
     tool_box._route_cache.clear()
 
-    assert next_journey_node("trip-map", "START", "Verity Observatory") == "STOP_05"
+    assert next_journey_node("trip-map", "SITE_1", "Verity Observatory") == "SITE_5"
 
 
 def test_mcp_server_lists_and_calls_tools(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -252,7 +280,7 @@ def test_mcp_server_lists_and_calls_tools(monkeypatch: pytest.MonkeyPatch) -> No
                 "get_name",
                 "calculate",
                 "identify_shape",
-                "recall_study_material",
+                "search",
                 "next_journey_node",
             }
             calculate_tool = next(
@@ -261,6 +289,8 @@ def test_mcp_server_lists_and_calls_tools(monkeypatch: pytest.MonkeyPatch) -> No
             properties = calculate_tool.input_schema["properties"]
             assert set(properties) == {"expression"}
             assert "standard precedence" in properties["expression"]["description"]
+            search_tool = next(tool for tool in listed.tools if tool.name == "search")
+            assert set(search_tool.input_schema["properties"]) == {"query"}
 
             name_result = await client.call_tool("get_name", {})
             assert name_result.structured_content == {"result": ASSISTANT_NAME}
@@ -278,8 +308,8 @@ def test_mcp_server_lists_and_calls_tools(monkeypatch: pytest.MonkeyPatch) -> No
             assert shape_result.structured_content == {"result": "triangle"}
 
             recall_result = await client.call_tool(
-                "recall_study_material",
-                {"question": "Which stop serves the Verity Observatory?"},
+                "search",
+                {"query": "Which stop serves the Verity Observatory?"},
             )
             assert "STOP_05" in recall_result.structured_content["result"][0]
 

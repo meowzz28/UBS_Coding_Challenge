@@ -68,16 +68,16 @@ server = MCPServer(
         "standard precedence and parentheses, so never split an expression into "
         "sequential calls or evaluate it left-to-right. Use identify_shape for "
         "base64-encoded PNG images. For an exam or factual recall question, call "
-        "recall_study_material with the complete question and answer only from the "
+        "search with the complete question and answer only from the "
         "returned source passages. For every journey hop, call next_journey_node "
         "with the map_id, current node, actual destination, and the supplied hop "
         "allowance when present; return its node exactly. For a school trip whose "
-        "destination is a named place rather than a node, first use "
-        "recall_study_material to find its STOP number, then navigate to that STOP. "
+        "destination is a named place rather than a node, first use search to find "
+        "its STOP number, then navigate to that STOP. "
         "Combine tools when a request contains more than one kind of task. Return "
         "tool results directly and do not guess."
     ),
-    version="2.0.0",
+    version="2.1.0",
 )
 
 
@@ -423,6 +423,24 @@ def _opposite_sides_match(corners: list[tuple[int, int]]) -> bool:
 
 
 @server.tool()
+def search(
+    query: Annotated[
+        str,
+        Field(
+            min_length=3,
+            max_length=1000,
+            description=(
+                "The complete factual question exactly as asked. Returns source "
+                "passages containing the answer; use their facts in the final answer."
+            ),
+        ),
+    ],
+) -> list[str]:
+    """Search all assigned study materials for passages that answer the query."""
+
+    return recall_study_material(query)
+
+
 def recall_study_material(
     question: Annotated[
         str,
@@ -659,7 +677,21 @@ _SYNONYM_GROUPS = (
     {"align", "alignment", "calibrate", "calibration", "recalibrate"},
     {"array", "grid", "hydrophone", "sensor"},
     {"boss", "chair", "director", "head", "lead", "leader", "investigator"},
-    {"crew", "employee", "engineer", "member", "participant", "resident", "staff"},
+    {
+        "crew",
+        "employee",
+        "engineer",
+        "member",
+        "participant",
+        "people",
+        "personnel",
+        "population",
+        "resident",
+        "scientist",
+        "staff",
+        "technician",
+        "worker",
+    },
     {"cap", "ceiling", "limit", "maximum", "threshold"},
     {"accident", "event", "failure", "fault", "incident"},
     {"schedule", "cadence", "cycle", "frequency", "interval"},
@@ -669,12 +701,138 @@ _SYNONYM_GROUPS = (
     {"vehicle", "craft", "submersible", "train", "trainset"},
     {"fix", "patch", "repair", "restore", "service"},
     {"medicine", "compound", "dose", "drug", "injection"},
+    {"experiment", "research", "study", "trial"},
 )
+
+_DOCUMENT_HINTS = {
+    1: {
+        "aboard",
+        "abyss",
+        "crew",
+        "deep",
+        "dive",
+        "facility",
+        "habitat",
+        "ocean",
+        "outpost",
+        "station",
+        "submersible",
+        "trench",
+        "undersea",
+        "underwater",
+    },
+    2: {
+        "bus",
+        "commuter",
+        "driver",
+        "fare",
+        "passenger",
+        "rail",
+        "rider",
+        "route",
+        "train",
+        "transit",
+        "transport",
+    },
+    3: {
+        "clinical",
+        "compound",
+        "dose",
+        "drug",
+        "injection",
+        "medical",
+        "medicine",
+        "patient",
+        "participant",
+        "study",
+        "trial",
+        "velmara",
+    },
+    4: {
+        "build",
+        "console",
+        "engine",
+        "game",
+        "graphics",
+        "physics",
+        "renderer",
+        "software",
+        "texture",
+    },
+    5: {
+        "agriculture",
+        "cooperative",
+        "crop",
+        "farm",
+        "farmer",
+        "grain",
+        "grower",
+        "harvest",
+        "produce",
+        "storage",
+    },
+}
+
+_SECTION_HINTS = {
+    "staffing roster": {
+        "aboard",
+        "count",
+        "crew",
+        "how many",
+        "live",
+        "people",
+        "personnel",
+        "population",
+        "resident",
+        "simultaneously",
+        "staff",
+    },
+    "membership roster": {
+        "count",
+        "household",
+        "how many",
+        "member",
+        "membership",
+        "people",
+    },
+    "leadership and team structure": {
+        "count",
+        "engineer",
+        "how many",
+        "personnel",
+        "simultaneously",
+        "staff",
+        "team",
+    },
+    "cohort structure": {
+        "cohort",
+        "enrolled",
+        "how many",
+        "participant",
+        "recruitment",
+    },
+    "leadership": {
+        "boss",
+        "charge",
+        "director",
+        "head",
+        "lead",
+        "leader",
+        "manage",
+        "responsible",
+        "run",
+    },
+    "incident": {"accident", "date", "failure", "fault", "happened", "incident"},
+    "calibration": {"alignment", "array", "calibrate", "grid", "sensor"},
+    "schedule": {"cadence", "cycle", "frequency", "how often", "interval", "schedule"},
+}
 
 
 def _stem(token: str) -> str:
     if token.startswith(("align", "calibr", "recalibr")):
         return "calibr"
+    if token == "runs":
+        return "run"
     for suffix in ("ation", "ments", "ment", "ingly", "edly", "ing", "ies", "ed", "s"):
         if len(token) > len(suffix) + 3 and token.endswith(suffix):
             if suffix == "ies":
@@ -710,6 +868,7 @@ def _rank_study_chunks(question: str) -> list[tuple[float, StudyChunk]]:
         term: sum(term in terms for terms in term_sets) for term in query_terms
     }
     question_words = _terms(question)
+    question_term_set = set(question_words)
     bigrams = {
         f"{question_words[index]} {question_words[index + 1]}"
         for index in range(len(question_words) - 1)
@@ -718,11 +877,39 @@ def _rank_study_chunks(question: str) -> list[tuple[float, StudyChunk]]:
     ranked: list[tuple[float, StudyChunk]] = []
     for chunk, chunk_terms in zip(chunks, term_sets, strict=True):
         normalized = " ".join(_terms(chunk.passage))
+        normalized_question = " ".join(question_words)
         score = 0.0
         for term, query_weight in query_terms.items():
             if term in chunk_terms:
                 rarity = math.log((len(chunks) + 1) / (document_frequency[term] + 1)) + 1
                 score += query_weight * rarity
+        document_hints = {_stem(term) for term in _DOCUMENT_HINTS[chunk.document_id]}
+        score += 2.4 * len(question_term_set & document_hints)
+        heading = chunk.heading.casefold()
+        for heading_fragment, raw_hints in _SECTION_HINTS.items():
+            if heading_fragment in heading:
+                hints = {
+                    stemmed
+                    for hint in raw_hints
+                    for stemmed in _terms(hint)
+                }
+                score += 3.2 * len(question_term_set & hints)
+        if any(
+            intent in normalized_question
+            for intent in ("charge", "lead", "manage", "responsible", "run")
+        ) and any(
+            marker in chunk.passage.casefold()
+            for marker in (
+                "director-general",
+                "elected chair",
+                "has served as",
+                "holds primary responsibility",
+                "lead architect",
+                "presided over",
+                "station director",
+            )
+        ):
+            score += 12.0
         score += 1.8 * sum(bigram in normalized for bigram in bigrams)
         stop_matches = set(re.findall(r"stop[_ -]?\d+", question.casefold()))
         if stop_matches and any(match.replace(" ", "_").replace("-", "_") in chunk.passage.casefold() for match in stop_matches):
@@ -733,8 +920,6 @@ def _rank_study_chunks(question: str) -> list[tuple[float, StudyChunk]]:
         key=lambda item: (
             -item[0],
             item[1].document_id,
-            item[1].heading,
-            item[1].passage,
         )
     )
     return ranked
@@ -817,19 +1002,35 @@ def _resolve_destination(destination: str, nodes: set[str]) -> str:
 
     explicit_stops = re.findall(r"STOP[_ -]?\d+", candidate, flags=re.IGNORECASE)
     for explicit_stop in explicit_stops:
-        normalized_stop = explicit_stop.upper().replace(" ", "_").replace("-", "_")
-        try:
-            return _match_node(normalized_stop, nodes, "destination")
-        except ValueError:
-            continue
+        for node_candidate in _stop_node_candidates(explicit_stop):
+            try:
+                return _match_node(node_candidate, nodes, "destination")
+            except ValueError:
+                continue
 
     for _, chunk in _rank_study_chunks(candidate)[:12]:
         for stop in re.findall(r"STOP_\d+", chunk.passage, flags=re.IGNORECASE):
-            try:
-                return _match_node(stop.upper(), nodes, "destination")
-            except ValueError:
-                continue
+            for node_candidate in _stop_node_candidates(stop):
+                try:
+                    return _match_node(node_candidate, nodes, "destination")
+                except ValueError:
+                    continue
     raise ValueError("destination could not be resolved to a node in this map")
+
+
+def _stop_node_candidates(stop: str) -> tuple[str, ...]:
+    """Accept both document STOP_05 and journey-map SITE_5 naming conventions."""
+
+    match = re.search(r"\d+", stop)
+    if match is None:
+        raise ValueError("stop identifier must contain a number")
+    number = int(match.group())
+    return (
+        f"STOP_{number:02d}",
+        f"STOP_{number}",
+        f"SITE_{number:02d}",
+        f"SITE_{number}",
+    )
 
 
 def _least_cost_route(

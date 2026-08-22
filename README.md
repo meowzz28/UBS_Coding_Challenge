@@ -178,7 +178,7 @@ The MCP server advertises five model-callable tools:
 | `get_name` | Returns the valid assigned name `Nova Box` |
 | `calculate` | Evaluates a complete `+`, `-`, `*`, `/` expression with precedence |
 | `identify_shape` | Classifies a base64 PNG as `rectangle`, `triangle`, or `circle` |
-| `recall_study_material` | Retrieves relevant source passages within the exact 900-token ceiling |
+| `search` | Retrieves relevant source passages within the exact 900-token ceiling |
 | `next_journey_node` | Returns the next adjacent node on the least-cost valid route |
 
 The shape tool supports filled and outlined shapes, arbitrary rotation, clipped
@@ -201,7 +201,8 @@ For journeys, the server retrieves the random directed graph using the opaque
 Hop-limited routes use constrained shortest-path search. Chosen routes are cached
 between calls so every returned hop is adjacent, never revisits a node, and stays
 within the allowance. Named school-trip destinations can also be resolved from
-the study materials to their documented `STOP_xx` node.
+the study materials, translating documented `STOP_xx` identifiers to the map's
+`SITE_x` convention when necessary.
 
 The FastAPI lifespan starts the MCP session manager used by legacy MCP clients,
 and the SDK also supports the current sessionless protocol on `/mcp`.
