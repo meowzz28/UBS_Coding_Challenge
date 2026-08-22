@@ -1,4 +1,4 @@
-"""MCP tools for Tool Box Phases 1 and 2."""
+"""MCP tools for all three Tool Box phases."""
 
 from __future__ import annotations
 
@@ -34,11 +34,20 @@ MAX_OPERATIONS = 20
 MAX_RECALL_TOKENS = 900
 CHALLENGE_ORIGIN = "https://tool-box-2591eaa24fa3.herokuapp.com"
 STUDY_MATERIAL_URLS = tuple(
-    f"{CHALLENGE_ORIGIN}/study-materials/{document_id}"
-    for document_id in range(1, 6)
+    f"{CHALLENGE_ORIGIN}/study-materials/{document_id}" for document_id in range(1, 6)
 )
 GRAPH_URL = f"{CHALLENGE_ORIGIN}/graph"
+EMAILS_URL = f"{CHALLENGE_ORIGIN}/emails"
 HTTP_TIMEOUT_SECONDS = 5.0
+WEEKDAYS = (
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+)
 _TOKEN_ENCODING = tiktoken.get_encoding("o200k_base")
 
 
@@ -48,18 +57,37 @@ class StudyChunk(NamedTuple):
     passage: str
 
 
+class Venue(NamedTuple):
+    name: str
+    x: int
+    y: int
+    available: tuple[tuple[int, int], ...]
+
+
+class Invitation(NamedTuple):
+    day: str
+    start: int
+    end: int
+    response: Literal["ACCEPTED", "DECLINED", "TENTATIVE"]
+
+
 _study_chunks: tuple[StudyChunk, ...] | None = None
 _study_lock = threading.Lock()
 _graph_cache: dict[str, dict[str, Any]] = {}
 _route_cache: dict[tuple[str, str], tuple[str, ...]] = {}
 _route_lock = threading.Lock()
+_venue_cache: dict[str, tuple[Venue, ...]] = {}
+_schedule_cache: dict[tuple[str, str], tuple[tuple[int, int], ...]] = {}
+_location_cache: dict[tuple[str, str], tuple[int, int]] = {}
+_invitation_cache: tuple[Invitation, ...] | None = None
+_working_life_lock = threading.Lock()
 
 server = MCPServer(
     name="UBS Tool Box",
-    title="Tool Box Phases 1 and 2",
+    title="Tool Box Phases 1, 2, and 3",
     description=(
         "Tools for identity, arithmetic, shape recognition, study recall, and "
-        "least-cost directed-graph journeys."
+        "journeys, plus exact venue, calendar, meeting-point, and outing planning."
     ),
     instructions=(
         "Use get_name when asked for your name. For every arithmetic question, "
@@ -73,10 +101,14 @@ server = MCPServer(
         "allowance when present; return its node exactly. For a school trip whose "
         "destination is a named place rather than a node, first use search to find "
         "its STOP number, then navigate to that STOP. "
+        "For Working Life questions, use find_open_venues, find_meeting_window, "
+        "find_meeting_point, or plan_outing according to the requested result. "
+        "These tools already apply the exact clock, calendar-preference, grid, "
+        "and whole-journey rules, so copy their result into the final answer. "
         "Combine tools when a request contains more than one kind of task. Return "
         "tool results directly and do not guess."
     ),
-    version="2.2.0",
+    version="3.0.0",
 )
 
 
@@ -283,7 +315,9 @@ def _largest_connected_component(
 def _classify_mask(
     mask: list[list[bool]],
 ) -> Literal["rectangle", "triangle", "circle"]:
-    points = [(x, y) for y, row in enumerate(mask) for x, value in enumerate(row) if value]
+    points = [
+        (x, y) for y, row in enumerate(mask) for x, value in enumerate(row) if value
+    ]
     min_x = min(x for x, _ in points)
     max_x = max(x for x, _ in points)
     min_y = min(y for _, y in points)
@@ -400,10 +434,7 @@ def _point_line_distance(
     delta_x = end[0] - start[0]
     delta_y = end[1] - start[1]
     numerator = abs(
-        delta_y * point[0]
-        - delta_x * point[1]
-        + end[0] * start[1]
-        - end[1] * start[0]
+        delta_y * point[0] - delta_x * point[1] + end[0] * start[1] - end[1] * start[0]
     )
     return numerator / max(1.0, math.hypot(delta_x, delta_y))
 
@@ -416,9 +447,9 @@ def _opposite_sides_match(corners: list[tuple[int, int]]) -> bool:
     def ratio(first: float, second: float) -> float:
         return min(first, second) / max(first, second, 1.0)
 
-    return ratio(lengths[0], lengths[2]) >= 0.70 and ratio(
-        lengths[1], lengths[3]
-    ) >= 0.70
+    return (
+        ratio(lengths[0], lengths[2]) >= 0.70 and ratio(lengths[1], lengths[3]) >= 0.70
+    )
 
 
 @server.tool()
@@ -481,6 +512,213 @@ def recall_study_material(
     if not passages:
         raise ValueError("no relevant study passage could be retrieved")
     return passages
+
+
+@server.tool()
+def find_open_venues(
+    day: Annotated[
+        str,
+        Field(description="Weekday name from Monday through Sunday."),
+    ],
+    time: Annotated[
+        str,
+        Field(
+            description=(
+                "Exact zero-padded hour to check in HH:MM 24-hour form, "
+                "such as 08:00 or 17:00."
+            )
+        ),
+    ],
+) -> str:
+    """Return every venue open at the requested hour as a comma-separated string."""
+
+    normalized_day = _normalize_day(day)
+    requested = _parse_time(time)
+    names = [
+        venue.name
+        for venue in _get_venues(normalized_day)
+        if any(start <= requested < end for start, end in venue.available)
+    ]
+    return ", ".join(names)
+
+
+@server.tool()
+def find_meeting_window(
+    day: Annotated[
+        str,
+        Field(description="Weekday name from Monday through Sunday."),
+    ],
+    people: Annotated[
+        list[str],
+        Field(
+            min_length=1,
+            max_length=12,
+            description=(
+                "Every friend named in the question. Do not omit anyone; the "
+                "android's own calendar is included automatically."
+            ),
+        ),
+    ],
+    earliest: Annotated[
+        str,
+        Field(description="Inclusive earliest start, zero-padded HH:MM."),
+    ],
+    latest: Annotated[
+        str,
+        Field(description="Latest allowed end, zero-padded HH:MM."),
+    ],
+    duration_minutes: Annotated[
+        int,
+        Field(
+            ge=60,
+            le=900,
+            description="Meeting duration in minutes; it must be a whole number of hours.",
+        ),
+    ],
+) -> dict[str, str]:
+    """Return the exact preferred meeting window that everyone can make."""
+
+    start, end = _best_meeting_window(
+        _normalize_day(day),
+        _normalize_people(people),
+        earliest,
+        latest,
+        duration_minutes,
+    )
+    return {"start": _format_time(start), "end": _format_time(end)}
+
+
+@server.tool()
+def find_meeting_point(
+    day: Annotated[
+        str,
+        Field(description="Weekday name from Monday through Sunday."),
+    ],
+    people: Annotated[
+        list[str],
+        Field(
+            min_length=1,
+            max_length=12,
+            description="Every friend named in the question, with nobody omitted.",
+        ),
+    ],
+    your_x: Annotated[
+        int, Field(ge=0, le=9, description="Your starting x coordinate.")
+    ],
+    your_y: Annotated[
+        int, Field(ge=0, le=9, description="Your starting y coordinate.")
+    ],
+) -> list[int]:
+    """Return an optimal grid point minimizing everyone's Manhattan travel."""
+
+    positions = _all_positions(
+        _normalize_day(day),
+        _normalize_people(people),
+        (your_x, your_y),
+    )
+    point, _ = _best_grid_point(positions)
+    return [point[0], point[1]]
+
+
+@server.tool()
+def plan_outing(
+    day: Annotated[
+        str,
+        Field(description="Weekday name from Monday through Sunday."),
+    ],
+    people: Annotated[
+        list[str],
+        Field(
+            min_length=1,
+            max_length=12,
+            description=(
+                "Every friend named in the outing question. The android is "
+                "included automatically."
+            ),
+        ),
+    ],
+    your_x: Annotated[
+        int, Field(ge=0, le=9, description="Your starting x coordinate.")
+    ],
+    your_y: Annotated[
+        int, Field(ge=0, le=9, description="Your starting y coordinate.")
+    ],
+    earliest: Annotated[
+        str,
+        Field(description="Inclusive earliest meeting start, zero-padded HH:MM."),
+    ],
+    latest: Annotated[
+        str,
+        Field(description="Latest allowed meeting end, zero-padded HH:MM."),
+    ],
+    duration_minutes: Annotated[
+        int,
+        Field(
+            ge=60,
+            le=900,
+            description="Meeting duration in minutes; it must be a whole number of hours.",
+        ),
+    ],
+) -> dict[str, str | list[int]]:
+    """Plan the valid meeting window, eating venue, and shortest whole journey."""
+
+    normalized_day = _normalize_day(day)
+    normalized_people = _normalize_people(people)
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        window_future = executor.submit(
+            _best_meeting_window,
+            normalized_day,
+            normalized_people,
+            earliest,
+            latest,
+            duration_minutes,
+        )
+        venues_future = executor.submit(_get_venues, normalized_day)
+        positions_future = executor.submit(
+            _all_positions,
+            normalized_day,
+            normalized_people,
+            (your_x, your_y),
+        )
+        meeting_start, meeting_end = window_future.result()
+        day_venues = venues_future.result()
+        positions = positions_future.result()
+
+    meal_end = meeting_end + 1
+    venues = [
+        venue
+        for venue in day_venues
+        if any(
+            available_start <= meeting_end and meal_end <= available_end
+            for available_start, available_end in venue.available
+        )
+    ]
+    if not venues:
+        raise ValueError(
+            "no venue is open for the full hour immediately after the meeting"
+        )
+
+    best: tuple[int, int, int, str, Venue] | None = None
+    for venue in venues:
+        for x in range(10):
+            for y in range(10):
+                travel = sum(
+                    abs(x - position_x) + abs(y - position_y)
+                    for position_x, position_y in positions
+                )
+                travel += abs(x - venue.x) + abs(y - venue.y)
+                candidate = (travel, x, y, venue.name.casefold(), venue)
+                if best is None or candidate[:4] < best[:4]:
+                    best = candidate
+
+    if best is None:
+        raise ValueError("outing could not be planned")
+    return {
+        "start": _format_time(meeting_start),
+        "end": _format_time(meeting_end),
+        "point": [best[1], best[2]],
+        "venue": best[4].name,
+    }
 
 
 @server.tool()
@@ -613,7 +851,7 @@ def _fetch_text(url: str) -> str:
             url,
             headers={
                 "Accept": "text/plain, text/markdown, application/json",
-                "User-Agent": "UBS-Tool-Box/2.0",
+                "User-Agent": "UBS-Tool-Box/3.0",
             },
             timeout=HTTP_TIMEOUT_SECONDS,
             follow_redirects=True,
@@ -622,6 +860,294 @@ def _fetch_text(url: str) -> str:
         return response.text
     except httpx.HTTPError as exc:
         raise ValueError("challenge data source is temporarily unavailable") from exc
+
+
+def _fetch_json(url: str) -> Any:
+    raw = _fetch_text(url)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("challenge data source returned invalid JSON") from exc
+
+
+def _normalize_day(day: str) -> str:
+    candidate = day.strip().casefold()
+    for weekday in WEEKDAYS:
+        if weekday.casefold() == candidate:
+            return weekday
+    raise ValueError("day must be a weekday name from Monday through Sunday")
+
+
+def _normalize_people(people: list[str]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    self_names = {"you", "yourself", "android", "nova box"}
+    for raw_person in people:
+        person = raw_person.strip().casefold()
+        if not person or len(person) > 80:
+            raise ValueError(
+                "each person must have a non-empty name under 81 characters"
+            )
+        if person in self_names:
+            continue
+        if person not in seen:
+            seen.add(person)
+            normalized.append(person)
+    if not normalized:
+        raise ValueError("people must contain at least one friend")
+    return tuple(normalized)
+
+
+def _parse_time(value: str) -> int:
+    match = re.fullmatch(r"(\d{2}):00", value.strip())
+    if match is None:
+        raise ValueError("times must be zero-padded whole hours in HH:MM form")
+    hour = int(match.group(1))
+    if not 8 <= hour <= 23:
+        raise ValueError("times must fall within the 08:00 to 23:00 day")
+    return hour
+
+
+def _format_time(hour: int) -> str:
+    return f"{hour:02d}:00"
+
+
+def _get_venues(day: str) -> tuple[Venue, ...]:
+    with _working_life_lock:
+        cached = _venue_cache.get(day)
+    if cached is not None:
+        return cached
+
+    encoded_day = urllib.parse.quote(day, safe="")
+    payload = _fetch_json(f"{CHALLENGE_ORIGIN}/venues/{encoded_day}")
+    raw_venues = payload.get("venues") if isinstance(payload, dict) else None
+    if not isinstance(raw_venues, list):
+        raise ValueError("venue source returned an invalid venue list")
+
+    venues: list[Venue] = []
+    for raw_venue in raw_venues:
+        if not isinstance(raw_venue, dict):
+            raise ValueError("venue source returned an invalid venue")
+        name = raw_venue.get("name")
+        x = raw_venue.get("x")
+        y = raw_venue.get("y")
+        raw_available = raw_venue.get("available")
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or isinstance(x, bool)
+            or not isinstance(x, int)
+            or isinstance(y, bool)
+            or not isinstance(y, int)
+            or not 0 <= x <= 9
+            or not 0 <= y <= 9
+            or not isinstance(raw_available, list)
+        ):
+            raise ValueError("venue source returned malformed venue details")
+        available = _parse_intervals(raw_available, "venue availability")
+        venues.append(Venue(name.strip(), x, y, available))
+
+    result = tuple(venues)
+    with _working_life_lock:
+        _venue_cache[day] = result
+    return result
+
+
+def _get_schedule(person: str, day: str) -> tuple[tuple[int, int], ...]:
+    key = (person, day)
+    with _working_life_lock:
+        cached = _schedule_cache.get(key)
+    if cached is not None:
+        return cached
+
+    encoded_person = urllib.parse.quote(person, safe="")
+    encoded_day = urllib.parse.quote(day, safe="")
+    payload = _fetch_json(f"{CHALLENGE_ORIGIN}/schedule/{encoded_person}/{encoded_day}")
+    raw_busy = payload.get("busy") if isinstance(payload, dict) else None
+    if not isinstance(raw_busy, list):
+        raise ValueError("schedule source returned an invalid busy list")
+    result = _parse_intervals(raw_busy, "busy interval")
+    with _working_life_lock:
+        _schedule_cache[key] = result
+    return result
+
+
+def _get_location(person: str, day: str) -> tuple[int, int]:
+    key = (person, day)
+    with _working_life_lock:
+        cached = _location_cache.get(key)
+    if cached is not None:
+        return cached
+
+    encoded_person = urllib.parse.quote(person, safe="")
+    encoded_day = urllib.parse.quote(day, safe="")
+    payload = _fetch_json(f"{CHALLENGE_ORIGIN}/location/{encoded_person}/{encoded_day}")
+    if not isinstance(payload, dict):
+        raise ValueError("location source returned invalid JSON")
+    x = payload.get("x")
+    y = payload.get("y")
+    if (
+        isinstance(x, bool)
+        or not isinstance(x, int)
+        or isinstance(y, bool)
+        or not isinstance(y, int)
+        or not 0 <= x <= 9
+        or not 0 <= y <= 9
+    ):
+        raise ValueError("location source returned invalid grid coordinates")
+    result = (x, y)
+    with _working_life_lock:
+        _location_cache[key] = result
+    return result
+
+
+def _get_invitations() -> tuple[Invitation, ...]:
+    global _invitation_cache
+    with _working_life_lock:
+        cached = _invitation_cache
+    if cached is not None:
+        return cached
+
+    payload = _fetch_json(EMAILS_URL)
+    raw_emails = payload.get("emails") if isinstance(payload, dict) else None
+    if not isinstance(raw_emails, list):
+        raise ValueError("inbox source returned an invalid email list")
+
+    invitations: list[Invitation] = []
+    pattern = re.compile(
+        r"^When:\s*(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+"
+        r"(\d{2}:00)-(\d{2}:00)\s*$",
+        flags=re.MULTILINE,
+    )
+    response_pattern = re.compile(
+        r"^Response:\s*(ACCEPTED|DECLINED|TENTATIVE)\s*$",
+        flags=re.MULTILINE,
+    )
+    for raw_email in raw_emails:
+        body = raw_email.get("body") if isinstance(raw_email, dict) else None
+        if not isinstance(body, str):
+            raise ValueError("inbox source returned an email without a body")
+        response_match = response_pattern.search(body)
+        when_match = pattern.search(body)
+        if response_match is None or when_match is None:
+            raise ValueError("inbox invitation is missing its Response or When line")
+        response = cast(
+            Literal["ACCEPTED", "DECLINED", "TENTATIVE"],
+            response_match.group(1),
+        )
+        start = _parse_time(when_match.group(2))
+        end = _parse_time(when_match.group(3))
+        if end <= start:
+            raise ValueError("inbox invitation has an invalid time range")
+        invitations.append(Invitation(when_match.group(1), start, end, response))
+
+    result = tuple(invitations)
+    with _working_life_lock:
+        _invitation_cache = result
+    return result
+
+
+def _parse_intervals(
+    raw_intervals: list[Any], field_name: str
+) -> tuple[tuple[int, int], ...]:
+    intervals: list[tuple[int, int]] = []
+    for raw_interval in raw_intervals:
+        if (
+            not isinstance(raw_interval, list)
+            or len(raw_interval) != 2
+            or not all(isinstance(value, str) for value in raw_interval)
+        ):
+            raise ValueError(f"{field_name} must contain [start, end] pairs")
+        start = _parse_time(raw_interval[0])
+        end = _parse_time(raw_interval[1])
+        if end <= start:
+            raise ValueError(f"{field_name} end must be after its start")
+        intervals.append((start, end))
+    return tuple(intervals)
+
+
+def _best_meeting_window(
+    day: str,
+    people: tuple[str, ...],
+    earliest: str,
+    latest: str,
+    duration_minutes: int,
+) -> tuple[int, int]:
+    if duration_minutes % 60:
+        raise ValueError("duration_minutes must be a whole number of hours")
+    first_hour = _parse_time(earliest)
+    final_hour = _parse_time(latest)
+    duration = duration_minutes // 60
+    if final_hour - first_hour < duration:
+        raise ValueError("the requested range is shorter than the meeting duration")
+
+    with ThreadPoolExecutor(max_workers=min(8, len(people))) as executor:
+        schedules = tuple(
+            executor.map(lambda person: _get_schedule(person, day), people)
+        )
+    hard_busy = [interval for schedule in schedules for interval in schedule]
+    tentative_busy: list[tuple[int, int]] = []
+    for invitation in _get_invitations():
+        if invitation.day != day or invitation.response == "DECLINED":
+            continue
+        target = hard_busy if invitation.response == "ACCEPTED" else tentative_busy
+        target.append((invitation.start, invitation.end))
+
+    feasible = [
+        (start, start + duration)
+        for start in range(first_hour, final_hour - duration + 1)
+        if not any(
+            _overlaps(start, start + duration, busy_start, busy_end)
+            for busy_start, busy_end in hard_busy
+        )
+    ]
+    if not feasible:
+        raise ValueError("no meeting window is available to everyone in the range")
+    clean = [
+        window
+        for window in feasible
+        if not any(
+            _overlaps(window[0], window[1], busy_start, busy_end)
+            for busy_start, busy_end in tentative_busy
+        )
+    ]
+    return clean[0] if clean else feasible[0]
+
+
+def _overlaps(
+    first_start: int, first_end: int, second_start: int, second_end: int
+) -> bool:
+    return first_start < second_end and second_start < first_end
+
+
+def _all_positions(
+    day: str,
+    people: tuple[str, ...],
+    your_position: tuple[int, int],
+) -> tuple[tuple[int, int], ...]:
+    with ThreadPoolExecutor(max_workers=min(8, len(people))) as executor:
+        friend_positions = tuple(
+            executor.map(lambda person: _get_location(person, day), people)
+        )
+    return (your_position, *friend_positions)
+
+
+def _best_grid_point(
+    positions: tuple[tuple[int, int], ...],
+) -> tuple[tuple[int, int], int]:
+    best: tuple[int, int, int] | None = None
+    for x in range(10):
+        for y in range(10):
+            travel = sum(
+                abs(x - position_x) + abs(y - position_y)
+                for position_x, position_y in positions
+            )
+            candidate = (travel, x, y)
+            if best is None or candidate < best:
+                best = candidate
+    if best is None:
+        raise ValueError("no meeting point could be calculated")
+    return (best[1], best[2]), best[0]
 
 
 def _get_study_chunks() -> tuple[StudyChunk, ...]:
@@ -932,18 +1458,16 @@ def _rank_study_chunks(question: str) -> list[tuple[float, StudyChunk]]:
         score = 0.0
         for term, query_weight in query_terms.items():
             if term in chunk_terms:
-                rarity = math.log((len(chunks) + 1) / (document_frequency[term] + 1)) + 1
+                rarity = (
+                    math.log((len(chunks) + 1) / (document_frequency[term] + 1)) + 1
+                )
                 score += query_weight * rarity
         document_hints = {_stem(term) for term in _DOCUMENT_HINTS[chunk.document_id]}
         score += 2.4 * len(question_term_set & document_hints)
         heading = chunk.heading.casefold()
         for heading_fragment, raw_hints in _SECTION_HINTS.items():
             if heading_fragment in heading:
-                hints = {
-                    stemmed
-                    for hint in raw_hints
-                    for stemmed in _terms(hint)
-                }
+                hints = {stemmed for hint in raw_hints for stemmed in _terms(hint)}
                 score += 3.2 * len(question_term_set & hints)
         if any(
             intent in normalized_question
@@ -963,7 +1487,10 @@ def _rank_study_chunks(question: str) -> list[tuple[float, StudyChunk]]:
             score += 12.0
         score += 1.8 * sum(bigram in normalized for bigram in bigrams)
         stop_matches = set(re.findall(r"stop[_ -]?\d+", question.casefold()))
-        if stop_matches and any(match.replace(" ", "_").replace("-", "_") in chunk.passage.casefold() for match in stop_matches):
+        if stop_matches and any(
+            match.replace(" ", "_").replace("-", "_") in chunk.passage.casefold()
+            for match in stop_matches
+        ):
             score += 20.0
         ranked.append((score, chunk))
 
@@ -1005,7 +1532,11 @@ def _validate_graph(
 
     tolls: dict[str, float] = {}
     for node, value in raw_tolls.items():
-        if not isinstance(node, str) or isinstance(value, bool) or not isinstance(value, (int, float)):
+        if (
+            not isinstance(node, str)
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+        ):
             raise ValueError("map tolls must be finite non-negative numbers")
         number = float(value)
         if not math.isfinite(number) or number < 0:
@@ -1024,7 +1555,9 @@ def _validate_graph(
                 or isinstance(value, bool)
                 or not isinstance(value, (int, float))
             ):
-                raise ValueError("map edges must target known nodes with numeric weights")
+                raise ValueError(
+                    "map edges must target known nodes with numeric weights"
+                )
             weight = float(value)
             if not math.isfinite(weight) or weight < 0:
                 raise ValueError("map edge weights must be finite and non-negative")
@@ -1095,9 +1628,7 @@ def _least_cost_route(
         hops_remaining if hops_remaining is not None else len(tolls) - 1,
         len(tolls) - 1,
     )
-    queue: list[tuple[float, int, tuple[str, ...], str]] = [
-        (0.0, 0, (start,), start)
-    ]
+    queue: list[tuple[float, int, tuple[str, ...], str]] = [(0.0, 0, (start,), start)]
     best: dict[tuple[str, int], float] = {(start, 0): 0.0}
 
     while queue:

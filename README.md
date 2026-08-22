@@ -168,7 +168,7 @@ The service uses one Uvicorn worker so all Ghost Chains requests share the same
 in-memory graph. A process restart restores clean startup state, and the evaluator
 can explicitly establish that state through `/ghost-chains/reset`.
 
-## Tool Box - Phases 1 and 2
+## Tool Box - Phases 1, 2, and 3
 
 Tool Box is exposed through the official MCP Streamable HTTP transport rather
 than an ordinary REST endpoint. Register this URL with the evaluator:
@@ -177,7 +177,7 @@ than an ordinary REST endpoint. Register this URL with the evaluator:
 https://YOUR-EXISTING-SERVICE.onrender.com/mcp
 ```
 
-The MCP server advertises six model-callable tools:
+The MCP server advertises ten model-callable tools:
 
 | Tool | Purpose |
 | --- | --- |
@@ -187,6 +187,10 @@ The MCP server advertises six model-callable tools:
 | `search` | Returns relevant passages as a JSON array within the 900-token ceiling |
 | `navigate` | Returns the next adjacent node on the least-cost valid route |
 | `next_journey_node` | Compatibility name for the same journey operation |
+| `find_open_venues` | Returns every venue open at a specified weekday and hour |
+| `find_meeting_window` | Applies friend schedules plus accepted/tentative inbox precedence |
+| `find_meeting_point` | Minimizes total Manhattan travel for the complete group |
+| `plan_outing` | Jointly solves the window, meeting point, and onward eating venue |
 
 The shape tool supports filled and outlined shapes, arbitrary rotation, clipped
 edges, isolated pixel noise, colored or dark foregrounds, transparency, and PNG
@@ -211,12 +215,23 @@ within the allowance. Named school-trip destinations can also be resolved from
 the study materials, translating documented `STOP_xx` identifiers to the map's
 `SITE_x` convention when necessary.
 
+For Phase 3, venue hours, friend schedules, daily locations, and the invitation
+inbox are fetched from the authoritative challenge endpoints and cached after
+validation. Meeting times use half-open hourly intervals: accepted invitations
+and friends' busy intervals are hard conflicts, declined invitations are ignored,
+and a later clean window beats every earlier tentative conflict. Grid problems
+enumerate the 10 by 10 city and include the android plus every named friend.
+`plan_outing` first selects the required meeting window and a venue open for the
+full following hour, then minimizes everyone's inbound Manhattan travel plus the
+onward trip to that venue as one joint objective.
+
 The FastAPI lifespan starts the MCP session manager used by legacy MCP clients,
 and the SDK also supports the current sessionless protocol on `/mcp`.
 
-The server advertises only six concise tools, well below the challenge limit of
-20. Phase 1 results stay below 1,200 tokens, and Phase 2 recall remains below its
-stricter 900-token ceiling. Remote challenge data is cached after its first use.
+The server advertises only ten concise tools, below the challenge limit of 20.
+Phase 1 and Phase 3 results stay far below 1,200 tokens, and Phase 2 recall remains
+below its stricter 900-token ceiling. Remote challenge data is cached after its
+first use.
 
 ## SHOWDOWN - Phases 1 and 2
 

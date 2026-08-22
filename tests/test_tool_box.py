@@ -13,12 +13,18 @@ from PIL import Image, ImageDraw
 from app.challenges import tool_box
 from app.challenges.tool_box import (
     ASSISTANT_NAME,
+    Invitation,
     StudyChunk,
+    Venue,
     _least_cost_route,
     calculate,
+    find_meeting_point,
+    find_meeting_window,
+    find_open_venues,
     identify_shape,
     navigate,
     next_journey_node,
+    plan_outing,
     recall_study_material,
     search,
     server,
@@ -76,7 +82,9 @@ def png_base64(
 
 def test_name_meets_phase_1_constraints() -> None:
     assert 3 <= len(ASSISTANT_NAME) <= 30
-    assert all(character.isalnum() or character in " _-'" for character in ASSISTANT_NAME)
+    assert all(
+        character.isalnum() or character in " _-'" for character in ASSISTANT_NAME
+    )
 
 
 def test_all_arithmetic_operators() -> None:
@@ -145,9 +153,18 @@ def test_recall_returns_relevant_passages_within_exact_token_budget(
 ) -> None:
     filler = "Additional unrelated operating detail. " * 70
     chunks = (
-        StudyChunk(1, "Calibration", "Calibration\nThe Kesterline hydrophone array was recalibrated on 14 March."),
-        StudyChunk(2, "Fares", "Fares\nThe daily transit fare cap is four pounds ninety."),
-        *(StudyChunk(3, "Background", f"Background {index}\n{filler}") for index in range(8)),
+        StudyChunk(
+            1,
+            "Calibration",
+            "Calibration\nThe Kesterline hydrophone array was recalibrated on 14 March.",
+        ),
+        StudyChunk(
+            2, "Fares", "Fares\nThe daily transit fare cap is four pounds ninety."
+        ),
+        *(
+            StudyChunk(3, "Background", f"Background {index}\n{filler}")
+            for index in range(8)
+        ),
     )
     monkeypatch.setattr(tool_box, "_study_chunks", chunks)
 
@@ -279,6 +296,140 @@ def test_school_trip_place_name_resolves_to_documented_stop(
     assert next_journey_node("trip-map", "SITE_1", "Verity Observatory") == "SITE_5"
 
 
+def test_phase_three_returns_every_venue_open_at_the_requested_hour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tool_box,
+        "_get_venues",
+        lambda _day: (
+            Venue("Breakfast Room", 1, 1, ((8, 10),)),
+            Venue("All Day Cafe", 2, 2, ((8, 23),)),
+            Venue("Late House", 3, 3, ((12, 18),)),
+        ),
+    )
+
+    assert find_open_venues("thursday", "08:00") == ("Breakfast Room, All Day Cafe")
+    assert find_open_venues("Thursday", "10:00") == "All Day Cafe"
+
+
+def test_phase_three_prefers_any_clean_window_over_earlier_tentative_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schedules = {"ada": ((13, 14),), "bram": ()}
+    monkeypatch.setattr(
+        tool_box,
+        "_get_schedule",
+        lambda person, _day: schedules[person],
+    )
+    monkeypatch.setattr(
+        tool_box,
+        "_get_invitations",
+        lambda: (
+            Invitation("Tuesday", 12, 13, "TENTATIVE"),
+            Invitation("Tuesday", 14, 15, "DECLINED"),
+            Invitation("Tuesday", 15, 16, "ACCEPTED"),
+        ),
+    )
+
+    assert find_meeting_window(
+        "Tuesday",
+        ["ada", "bram"],
+        "12:00",
+        "17:00",
+        60,
+    ) == {"start": "14:00", "end": "15:00"}
+
+
+def test_phase_three_uses_tentative_window_only_when_no_clean_window_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tool_box, "_get_schedule", lambda _person, _day: ())
+    monkeypatch.setattr(
+        tool_box,
+        "_get_invitations",
+        lambda: (
+            Invitation("Friday", 12, 13, "TENTATIVE"),
+            Invitation("Friday", 13, 14, "ACCEPTED"),
+        ),
+    )
+
+    assert find_meeting_window(
+        "Friday",
+        ["iris"],
+        "12:00",
+        "14:00",
+        60,
+    ) == {"start": "12:00", "end": "13:00"}
+
+
+def test_phase_three_meeting_point_counts_android_and_every_friend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locations = {"ada": (0, 9), "bram": (9, 9)}
+    monkeypatch.setattr(
+        tool_box,
+        "_get_location",
+        lambda person, _day: locations[person],
+    )
+
+    assert find_meeting_point("Wednesday", ["ada", "bram"], 4, 0) == [4, 9]
+
+
+def test_phase_three_outing_jointly_optimizes_meeting_point_and_venue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tool_box, "_get_schedule", lambda _person, _day: ())
+    monkeypatch.setattr(tool_box, "_get_invitations", lambda: ())
+    monkeypatch.setattr(tool_box, "_get_location", lambda _person, _day: (9, 0))
+    monkeypatch.setattr(
+        tool_box,
+        "_get_venues",
+        lambda _day: (
+            Venue("End Cafe", 9, 0, ((14, 16),)),
+            Venue("Closed Cafe", 0, 0, ((8, 14),)),
+        ),
+    )
+
+    assert plan_outing(
+        "Monday",
+        ["dov"],
+        0,
+        0,
+        "13:00",
+        "15:00",
+        60,
+    ) == {
+        "start": "13:00",
+        "end": "14:00",
+        "point": [9, 0],
+        "venue": "End Cafe",
+    }
+
+
+def test_phase_three_inbox_parser_uses_only_authoritative_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tool_box, "_invitation_cache", None)
+    monkeypatch.setattr(
+        tool_box,
+        "_fetch_json",
+        lambda _url: {
+            "emails": [
+                {
+                    "body": (
+                        "Response: TENTATIVE\n"
+                        "When: Sunday 14:00-15:00\n\n"
+                        "This used to be at 16:00 but that is no longer current."
+                    )
+                }
+            ]
+        },
+    )
+
+    assert tool_box._get_invitations() == (Invitation("Sunday", 14, 15, "TENTATIVE"),)
+
+
 def test_mcp_server_lists_and_calls_tools(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         tool_box,
@@ -300,6 +451,14 @@ def test_mcp_server_lists_and_calls_tools(monkeypatch: pytest.MonkeyPatch) -> No
         },
     )
     tool_box._route_cache.clear()
+    monkeypatch.setattr(tool_box, "_get_schedule", lambda _person, _day: ())
+    monkeypatch.setattr(tool_box, "_get_invitations", lambda: ())
+    monkeypatch.setattr(tool_box, "_get_location", lambda _person, _day: (9, 0))
+    monkeypatch.setattr(
+        tool_box,
+        "_get_venues",
+        lambda _day: (Venue("End Cafe", 9, 0, ((14, 16),)),),
+    )
 
     async def scenario() -> None:
         async with Client(server, raise_exceptions=True) as client:
@@ -311,6 +470,10 @@ def test_mcp_server_lists_and_calls_tools(monkeypatch: pytest.MonkeyPatch) -> No
                 "search",
                 "navigate",
                 "next_journey_node",
+                "find_open_venues",
+                "find_meeting_window",
+                "find_meeting_point",
+                "plan_outing",
             }
             calculate_tool = next(
                 tool for tool in listed.tools if tool.name == "calculate"
@@ -365,6 +528,25 @@ def test_mcp_server_lists_and_calls_tools(monkeypatch: pytest.MonkeyPatch) -> No
                 },
             )
             assert journey_result.structured_content == {"result": "STOP_05"}
+
+            outing_result = await client.call_tool(
+                "plan_outing",
+                {
+                    "day": "Monday",
+                    "people": ["dov"],
+                    "your_x": 0,
+                    "your_y": 0,
+                    "earliest": "13:00",
+                    "latest": "15:00",
+                    "duration_minutes": 60,
+                },
+            )
+            assert outing_result.structured_content == {
+                "start": "13:00",
+                "end": "14:00",
+                "point": [9, 0],
+                "venue": "End Cafe",
+            }
 
     asyncio.run(scenario())
 
