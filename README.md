@@ -74,6 +74,12 @@ perform the original transformation:
 - `adaptInput.action` is converted to lowercase
 - priorities map as `LOW = 1`, `MEDIUM = 2`, and `HIGH = 3`
 
+Phase 2 payloads may also include `heartbeats` and an `sloQuery`. The server
+filters heartbeats to the requested service with `timestamp >= since`, calculates
+availability as the fraction whose status is `OK`, and reports the nearest-rank
+95th-percentile latency. If the filtered window is empty, both metrics are zero.
+Phase 1 payloads remain supported and omit `sloOutput` from the response.
+
 ## Ghost Chains - Phase 1
 
 The Ghost Chains implementation maintains an in-memory directed transaction
